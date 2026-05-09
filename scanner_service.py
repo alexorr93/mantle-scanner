@@ -312,79 +312,88 @@ def make_prompt(photo_count: int, condition: str = "used", ebay_data: dict = Non
         market_section = f"""EBAY MARKET DATA (PRIMARY SOURCE):
 {ebay_data["summary"]}
 
-Use these prices as your foundation. Verify with Google Search for any sold listings missing from this data."""
+Use these prices as your foundation. Supplement with Google Search for any missing sold data."""
     else:
-        market_section = """MARKET RESEARCH (USE GOOGLE SEARCH):
-Run these searches IN ORDER:
-1. PRIMARY: '[brand] [part number] sold ebay' - find sold/completed listings
-2. SECONDARY: '[brand] [part number] ebay' - find active Buy It Now listings
-3. TERTIARY: '[brand] [part number] price' - find dealer/distributor pricing
-4. VERIFICATION: '[brand] [part number] datasheet' - confirm correct item
-
-Prioritize SOLD prices over ACTIVE prices."""
+        market_section = """MARKET RESEARCH — RUN GOOGLE SEARCHES IN THIS ORDER:
+1. "[item name] sold ebay" — find completed/sold listings
+2. "[item name] site:amazon.com" — find current retail price
+3. "[item name] ebay" — find active Buy It Now only as last resort"""
 
     id_section = f"""PRE-IDENTIFIED TITLE: "{id_title}"
+Verify correctness via research. Improve if research reveals the actual product name.
+NEVER use: Empty, Bag, Industrial Part, Unknown Item.""" if id_title else ""
 
-If a part number exists, RESEARCH IT to confirm correctness.
-Improve the title if research reveals the actual product name.
-NEVER keep generic words like Empty Bag, Industrial Part, Unknown Item.""" if id_title else ""
+    return f"""You are an elite secondary market pricing actuary. Your objective is the TRUE liquid cash value — what a buyer will actually pay on eBay today — not asking prices.
 
-    return f"""You are a senior resale pricing specialist analyzing {photo_count} photo(s) for eBay resale. You price all types of items — electronics, clothing, collectibles, tools, toys, sporting goods, industrial parts, and anything else people sell on eBay.
+Analyzing {photo_count} photo(s) for eBay resale.
 {id_section}
+
+Condition marked: {condition.upper()}
 
 {market_section}
 
-Employee marked this item as: {condition.upper()}
+=== WATERFALL EVALUATION PROTOCOL — FOLLOW STRICTLY IN ORDER ===
 
-PRICING WATERFALL - FOLLOW IN ORDER:
+TIER 1 — VERIFIED SOLD COMPS (Gold Standard)
+Search for recent SOLD/COMPLETED listings on eBay (last 90 days).
+- Extract ALL sold prices you can find. Discard extreme outliers. Calculate the AVERAGE.
+- "Open Box" or "New Other" sold = equivalent to NEW condition.
+- USED sold comps: use average directly.
+- NEW sold comps: use average directly.
+- If Tier 1 data found: SET pricing_tier="SOLD_COMPS" and STOP HERE.
 
-TIER 1 (BEST): Recent SOLD eBay listings (last 90 days)
-- Use median of 3+ sold prices
-- USED items 60-80% of NEW sold price
-- If you find sold comps, STOP HERE
+TIER 2 — RETAIL REALITY CHECK
+If no sold comps exist, search current retail (Amazon, Walmart, manufacturer site).
+- Used resale = 55% to 70% of current retail price (brand-dependent).
+- New/sealed resale = 75% to 85% of current retail price.
+- CRITICAL: Secondary market value CANNOT exceed current retail price.
+- If Tier 2 data found: SET pricing_tier="RETAIL_ANCHORED" and STOP HERE.
 
-TIER 2: Active eBay listings + Buy It Now
-- Active listings are 15-25% above true market value
-- Recommended price = lowest active times 0.85
+TIER 3 — INDUSTRIAL/SPECIALTY DEALERS
+For specialized items with no retail or sold comps (Grainger, MSC, Radwell, surplus sites).
+- Used resale = strictly 50% to 60% of dealer listed price.
+- New/sealed resale = 70% to 80% of dealer listed price.
+- If Tier 3 data found: SET pricing_tier="DEALER_DISCOUNTED" and STOP HERE.
 
-TIER 3: Dealer/distributor pricing (Grainger, MSC, AutomationDirect)
-- These are RETAIL - eBay resale is 40-60% of dealer for USED, 70-85% for NEW
+TIER 4 — ACTIVE LISTINGS (Last Resort Only)
+Only use if Tiers 1-3 all fail completely.
+- Active listings are ASKING prices, not reality. Sellers routinely overprice.
+- Take the LOWEST active listing and multiply by 0.60 to get true value.
+- SET pricing_tier="ACTIVE_LISTINGS".
 
-TIER 4: Limited or no market data found
-- Use your knowledge to provide a REASONABLE ESTIMATE based on item type
-- Generic items: blank cotton tee $5-15 used, $10-25 new; basic hardware $5-20
-- Industrial parts without data: use category-typical pricing as starting point
-- Set pricing_tier to "ESTIMATED" to be transparent
-- Better to provide a starting point than $0
+TIER 5 — REASONED ESTIMATE
+If zero market data found anywhere:
+- Use category knowledge for a starting estimate.
+- Consumer electronics used: $10-40 typical range.
+- Clothing used: $5-25, new: $10-40.
+- Tools used: $10-50, new: $20-80.
+- SET pricing_tier="ESTIMATED". Never output $0 unless item is genuinely unsellable.
 
-CRITICAL RULES:
-1. ONLY claim "SOLD_COMPS" if you found actual sold listing data with prices.
-2. If estimating, set pricing_tier to "ESTIMATED" - never falsely claim sold data.
-3. Dealer prices need discount applied.
-4. NEW vs USED prices researched separately.
-5. Always try to provide a reasonable price - $0 only for genuinely obscure items.
+AGGREGATION RULES:
+- Never anchor to a single price. Always extract multiple data points.
+- Always show your math in data_sources_count.
+- USED and NEW prices must be researched separately.
 
 EBAY CATEGORIES:
-- PLCs: 115708, Sensors: 78189, Hydraulic valves: 98463
-- Pumps: 12576, Cylinders: 123455, Seals: 123461
-- Motors: 124660, VFDs: 115082, CAT parts: 177007
-- Circuit breakers: 66825, Contactors: 66828
+Consumer Electronics: 293, Clothing: 11450, Tools: 631, Toys: 220, Collectibles: 1
+PLCs: 115708, Sensors: 78189, Hydraulic valves: 98463, Pumps: 12576
+Motors: 124660, VFDs: 115082, Circuit breakers: 66825, Contactors: 66828
 
-OUTPUT - Return ONLY raw JSON:
+OUTPUT — Return ONLY raw JSON, no markdown:
 
 {{
-  "title": "Improved title under 80 chars",
+  "title": "Improved eBay title under 80 chars",
   "ebay_category": "Full category path",
   "ebay_category_id": <number>,
-  "weight_oz": <ounces>,
-  "weight_lb": <pounds>,
+  "weight_oz": <number>,
+  "weight_lb": <number>,
   "price_used_low": <number>,
   "price_used_high": <number>,
   "price_used": <number>,
   "price_new_low": <number>,
   "price_new_high": <number>,
   "price_new": <number>,
-  "pricing_tier": "SOLD_COMPS" or "ACTIVE_LISTINGS" or "DEALER_DISCOUNTED" or "NO_DATA",
+  "pricing_tier": "SOLD_COMPS" or "RETAIL_ANCHORED" or "DEALER_DISCOUNTED" or "ACTIVE_LISTINGS" or "ESTIMATED",
   "data_sources_count": <number>
 }}
 """
