@@ -169,42 +169,50 @@ import requests as _requests
 def _ebay_find(operation: str, keywords: str, extra_params: dict = {}) -> list[dict]:
     """
     Call eBay Finding API and return list of item dicts with price + title + url.
-    operation: findCompletedItems | findItemsAdvanced
+    operation: findCompletedItems | findItemsAdvanced (Browse API)
     """
-    if not EBAY_APP_ID or "SBX" in EBAY_APP_ID:
+    if not EBAY_APP_ID:
+        return []
+    token = get_ebay_token()
+    if not token:
         return []
     short_kw = " ".join(keywords.split()[:7])
-    params = {
-        "OPERATION-NAME":               operation,
-        "SERVICE-VERSION":              "1.0.0",
-        "SECURITY-APPNAME":             EBAY_APP_ID,
-        "RESPONSE-DATA-FORMAT":         "JSON",
-        "keywords":                     short_kw,
-        "sortOrder":                    "EndTimeSoonest",
-        "paginationInput.entriesPerPage": "20",
-        **extra_params
-    }
     try:
-        resp = _requests.get(
-            "https://svcs.ebay.com/services/search/FindingService/v1",
-            params=params, timeout=12
+        import requests as _req
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "X-EBAY-C-MARKETPLACE-ID": "EBAY_US",
+        }
+        params = {"q": short_kw, "limit": "20"}
+        if operation == "findCompletedItems":
+            params["filter"] = "buyingOptions:{FIXED_PRICE|AUCTION}"
+        else:
+            params["filter"] = "buyingOptions:{FIXED_PRICE}"
+        resp = _req.get(
+            "https://api.ebay.com/buy/browse/v1/item_summary/search",
+            params=params,
+            headers=headers,
+            timeout=12,
         )
         resp.raise_for_status()
         data = resp.json()
-        key  = operation + "Response"
-        items = (data.get(key, [{}])[0]
-                     .get("searchResult", [{}])[0]
-                     .get("item", []))
+        items = data.get("itemSummaries", [])
         results = []
         for item in items:
             try:
-                price  = float(item["sellingStatus"][0]["currentPrice"][0]["__value__"])
-                title  = item.get("title", [""])[0]
-                url    = item.get("viewItemURL", [""])[0]
-                cond   = item.get("condition", [{}])[0].get("conditionDisplayName", [""])[0]
-                results.append({"price": price, "title": title, "url": url, "condition": cond})
+                price = float((item.get("price") or {}).get("value", 0))
+                if price <= 0:
+                    continue
+                results.append({
+                    "price": price,
+                    "title": item.get("title", ""),
+                    "url": item.get("itemWebUrl", ""),
+                    "condition": item.get("condition") or "Unknown",
+                })
             except Exception:
                 continue
+        print(f"   eBay Browse API ({operation}): {len(results)} results")
         return results
     except Exception as _err:
         print(f"   eBay API error ({operation}): {_err}")
