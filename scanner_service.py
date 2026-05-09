@@ -381,6 +381,8 @@ AGGREGATION RULES:
 - Never anchor to a single price. Always extract multiple data points.
 - Always show your math in data_sources_count.
 - USED and NEW prices must be researched separately.
+- You MUST always provide BOTH price_used AND price_new. Never leave either as 0.
+- If you can only find one condition, estimate the other: used = new x 0.65, new = used / 0.65.
 
 EBAY CATEGORIES:
 Consumer Electronics: 293, Clothing: 11450, Tools: 631, Toys: 220, Collectibles: 1
@@ -738,6 +740,18 @@ CHAIN OF THOUGHT: Fill raw_text_read first, then verified_brand, then verified_p
                         print(f"   📂 eBay category: {ebay_category} (ID: {ebay_category_id})")
             except Exception as _ce:
                 print(f"   ⚠️  Category lookup failed: {_ce}")
+
+        # Derive missing prices — if only one is set, estimate the other
+        if price_new > 0 and price_used == 0:
+            price_used = round(price_new * 0.65, 2)
+            price_used_low = round(price_new * 0.55, 2)
+            price_used_high = round(price_new * 0.75, 2)
+            print(f"   📊 Derived used price from new: ${price_used}")
+        elif price_used > 0 and price_new == 0:
+            price_new = round(price_used / 0.65, 2)
+            price_new_low = round(price_used / 0.75, 2)
+            price_new_high = round(price_used / 0.55, 2)
+            print(f"   📊 Derived new price from used: ${price_new}")
 
         # Sanity check: used price should never exceed new price
         # If Gemini returns inverted values, swap them
