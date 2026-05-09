@@ -739,6 +739,14 @@ CHAIN OF THOUGHT: Fill raw_text_read first, then verified_brand, then verified_p
             except Exception as _ce:
                 print(f"   ⚠️  Category lookup failed: {_ce}")
 
+        # Sanity check: used price should never exceed new price
+        # If Gemini returns inverted values, swap them
+        if price_used > 0 and price_new > 0 and price_used > price_new:
+            print(f"   ⚠️  Price sanity: used (${price_used}) > new (${price_new}), swapping")
+            price_used, price_new = price_new, price_used
+            price_used_low, price_new_low = price_new_low, price_used_low
+            price_used_high, price_new_high = price_new_high, price_used_high
+
         if condition == "used":
             active_price = price_used if price_used > 0 else price_new
             active_low   = price_used_low if price_used_low > 0 else price_new_low
