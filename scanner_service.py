@@ -423,6 +423,120 @@ class PartIdentification(BaseModel):
     generated_title: str = Field(description="Final eBay title, maximum 80 characters. Must end at a complete word — never cut off mid-word. Priority: brand + part number + item type + key specs. Drop least important words to stay under 80 chars cleanly.")
 
 
+def _fill_aspects_at_scan(title: str, brand: str, part_number: str, category_id: str) -> dict:
+    """Fetch required eBay aspects for category and fill them with Gemini. Called at scan time."""
+    import requests as _rq, json as _j
+    aspects = {}
+    try:
+        # Get app-level token
+        import base64 as _b64
+        creds = _b64.b64encode(f"{EBAY_APP_ID}:{EBAY_CERT_ID}".encode()).decode()
+        tok_r = _rq.post(
+            "https://api.ebay.com/identity/v1/oauth2/token",
+            headers={"Authorization": f"Basic {creds}", "Content-Type": "application/x-www-form-urlencoded"},
+            data="grant_type=client_credentials&scope=https://api.ebay.com/oauth/api_scope",
+            timeout=8
+        )
+        app_token = tok_r.json().get("access_token", "")
+        if not app_token:
+            return aspects
+
+        # Fetch required aspects for this category
+        asp_r = _rq.get(
+            f"https://api.ebay.com/commerce/taxonomy/v1/category_tree/0/get_item_aspects_for_category?category_id={category_id}",
+            headers={"Authorization": f"Bearer {app_token}"},
+            timeout=8
+        )
+        if not asp_r.ok:
+            return aspects
+
+        required = []
+        recommended = []
+        for asp in asp_r.json().get("aspects", []):
+            name = asp.get("localizedAspectName", "")
+            usage = asp.get("aspectConstraint", {}).get("aspectUsage", "OPTIONAL")
+            mode  = asp.get("aspectConstraint", {}).get("aspectMode", "FREE_TEXT")
+            vals  = [v.get("localizedValue","") for v in asp.get("aspectValues", [])[:12] if v.get("localizedValue")]
+            if usage == "REQUIRED":
+                required.append({"name": name, "mode": mode, "values": vals})
+            elif usage == "RECOMMENDED":
+                recommended.append({"name": name, "mode": mode, "values": vals})
+
+        ask = required + recommended[:4]
+        if not ask:
+            return aspects
+
+        # Build Gemini prompt
+        fields = []
+        for a in ask:
+            if a["mode"] == "SELECTION_ONLY" and a["values"]:
+                fields.append(f'  "{a["name"]}": choose best from {a["values"][:8]}')
+            else:
+                fields.append(f'  "{a["name"]}": short accurate value')
+
+        prompt = f"""You are an expert eBay reseller. Fill in item specifics for this product.
+
+Title: {title}
+Brand: {brand or "Unbranded"}
+Part/Model number: {part_number or "N/A"}
+
+Rules:
+- For SELECTION fields, pick the BEST matching option from the list given
+- If genuinely unknown, use "Does Not Apply" for required fields
+- Never use placeholder values or random options
+- Keep values concise and accurate
+
+Return ONLY raw JSON (no markdown):
+{{
+{chr(10).join(fields)}
+}}"""
+
+        resp = client.models.generate_content(
+            model=model,
+            contents=[{"role": "user", "parts": [{"text": prompt}]}]
+        )
+        raw = (resp.text or "").strip().replace("```json","").replace("```","").strip()
+        filled = _j.loads(raw)
+
+        # Smart fallbacks for common required fields
+        FALLBACKS = {
+            "Brand": brand or "Unbranded",
+            "MPN": part_number or "Does Not Apply",
+            "Model": part_number or "Does Not Apply",
+            "Type": "Other",
+            "Color": "Multicolor",
+            "Department": "Unisex Adults",
+            "Size": "One Size",
+            "Size Type": "Regular",
+            "US Shoe Size": "10",
+            "Connectivity": "Wireless",
+            "Country of Origin": "China",
+            "Material": "Mixed Materials",
+        }
+        for a in required:
+            name = a["name"]
+            val = filled.get(name, "")
+            if not val or val in ("Does Not Apply", "N/A", "Unknown", ""):
+                if name in FALLBACKS:
+                    filled[name] = FALLBACKS[name]
+                elif a["mode"] == "SELECTION_ONLY" and a["values"]:
+                    filled[name] = a["values"][0]
+                else:
+                    filled[name] = "Does Not Apply"
+            aspects[name] = filled[name]
+
+        # Also add recommended if filled
+        for a in recommended[:4]:
+            name = a["name"]
+            if filled.get(name) and filled[name] not in ("", "Does Not Apply"):
+                aspects[name] = filled[name]
+
+        print(f"   🏷️  Aspects filled: {list(aspects.keys())}")
+    except Exception as e:
+        print(f"   ⚠️  Aspect fill error: {e}")
+    return aspects
+
+
 def process_group(group: dict):
     group_id    = group["id"]
     condition   = group.get("condition", "used")
@@ -741,6 +855,19 @@ CHAIN OF THOUGHT: Fill raw_text_read first, then verified_brand, then verified_p
             except Exception as _ce:
                 print(f"   ⚠️  Category lookup failed: {_ce}")
 
+        # ── Fill eBay item specifics at scan time ──────────────────────
+        ebay_item_specifics = {}
+        if ebay_category_id and ebay_category_id not in ("0", ""):
+            try:
+                ebay_item_specifics = _fill_aspects_at_scan(
+                    title=title,
+                    brand=verified_brand if verified_brand and verified_brand != "UNBRANDED" else "",
+                    part_number=verified_pn if verified_pn and verified_pn != "UNKNOWN" else "",
+                    category_id=ebay_category_id
+                )
+            except Exception as _asp_e:
+                print(f"   ⚠️  Scan-time aspect fill failed: {_asp_e}")
+
         # Derive missing prices — if only one is set, estimate the other
         if price_new > 0 and price_used == 0:
             price_used = round(price_new * 0.65, 2)
@@ -808,6 +935,10 @@ CHAIN OF THOUGHT: Fill raw_text_read first, then verified_brand, then verified_p
         "status":           "scanned",
         "sold_count":       sold_count,
         "created_at":       scanned_at,
+        "brand":            verified_brand if verified_brand and verified_brand != "UNBRANDED" else None,
+        "mpn":              verified_pn if verified_pn and verified_pn != "UNKNOWN" else None,
+        "model":            verified_pn if verified_pn and verified_pn != "UNKNOWN" else None,
+        "ebay_item_specifics": ebay_item_specifics if ebay_item_specifics else None,
     }).execute()
 
     supabase.table("listing_groups").update({"status": "done"}).eq("id", group_id).execute()
