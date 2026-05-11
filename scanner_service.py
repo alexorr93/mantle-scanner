@@ -459,6 +459,28 @@ class PartIdentification(BaseModel):
     generated_title: str = Field(description="Final eBay title, maximum 80 characters. Must end at a complete word — never cut off mid-word. Priority: brand + part number + item type + key specs. Drop least important words to stay under 80 chars cleanly.")
 
 
+def _extract_brand_from_title(title: str) -> str | None:
+    """Extract brand from title when visual identification fails."""
+    if not title:
+        return None
+    known_brands = [
+        "Nike","Adidas","Jordan","Yeezy","New Balance","Puma","Reebok","Vans","Converse",
+        "KAWS","Medicom","Bearbrick","Funko","LEGO","Hot Wheels","Mattel","Hasbro",
+        "Apple","Samsung","Sony","Bose","JBL","Beats","Dyson","Dell","HP","Lenovo","Asus",
+        "Nintendo","PlayStation","Xbox","Atari","Sega",
+        "Louis Vuitton","Gucci","Coach","Michael Kors","Kate Spade","Tory Burch",
+        "Supreme","Palace","Stussy","Off-White","Fear of God","Carhartt","Patagonia","Arc'teryx",
+        "Rolex","Omega","Seiko","Casio","Fossil","Timex","TAG Heuer",
+        "Pokemon","Topps","Panini","Upper Deck","Leaf",
+        "DeWalt","Milwaukee","Makita","Bosch","Ryobi","Craftsman","Stanley",
+    ]
+    title_lower = title.lower()
+    for brand in known_brands:
+        if brand.lower() in title_lower:
+            return brand
+    return None
+
+
 def _fill_aspects_at_scan(title: str, brand: str, part_number: str, category_id: str) -> dict:
     """Fetch required eBay aspects for category and fill them with Gemini. Called at scan time."""
     import requests as _rq, json as _j
@@ -971,7 +993,7 @@ CHAIN OF THOUGHT: Fill raw_text_read first, then verified_brand, then verified_p
         "status":           "scanned",
         "sold_count":       sold_count,
         "created_at":       scanned_at,
-        "brand":            verified_brand if verified_brand and verified_brand != "UNBRANDED" else None,
+        "brand":            (verified_brand if verified_brand and verified_brand not in ("UNBRANDED", "UNKNOWN") else None) or _extract_brand_from_title(title),
         "mpn":              verified_pn if verified_pn and verified_pn != "UNKNOWN" else None,
         "model":            verified_pn if verified_pn and verified_pn != "UNKNOWN" else None,
         "ebay_item_specifics": ebay_item_specifics if ebay_item_specifics else None,
