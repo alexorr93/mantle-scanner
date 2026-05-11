@@ -340,22 +340,47 @@ Condition marked: {condition.upper()}
 
 {market_section}
 
-=== WATERFALL EVALUATION PROTOCOL — FOLLOW STRICTLY IN ORDER ===
+=== PHASE 1: DEEP IDENTIFICATION ===
+Before pricing, lock in the EXACT item. Identify:
+- Brand & core product name
+- Variant anchors: size/dimensions, year of release, edition type (Open vs Limited), model number, material
+- If the photo does not provide enough detail to confirm the exact variant, flag is_ambiguous=true
 
+=== PHASE 2: CATEGORY TRIAGE ===
+Classify into ONE economic model:
+- MODEL A (Standard/Electronics/Tools/Industrial): Subject to depreciation. Resale value CANNOT exceed current retail.
+- MODEL B (Collectibles/Hype/Art/Vintage/Trading Cards/Sneakers/Designer): Subject to scarcity economics. Resale CAN and OFTEN DOES exceed original retail. Examples: KAWS, Nike limited editions, Pokémon cards, vintage watches, sports cards, Funko grails.
+
+=== PHASE 3: FORKED WATERFALL PROTOCOL ===
+
+IF MODEL A (Standard):
 TIER 1 — VERIFIED SOLD COMPS (Gold Standard)
-Search for recent SOLD/COMPLETED listings on eBay (last 90 days).
-- Extract ALL sold prices you can find. Discard extreme outliers. Calculate the AVERAGE.
-- "Open Box" or "New Other" sold = equivalent to NEW condition.
-- USED sold comps: use average directly.
-- NEW sold comps: use average directly.
-- If Tier 1 data found: SET pricing_tier="SOLD_COMPS" and STOP HERE.
+Search eBay completed/sold listings last 90 days. Extract ALL prices, discard outliers, average the rest.
+- If Tier 1 found: SET pricing_tier="SOLD_COMPS" and STOP.
 
 TIER 2 — RETAIL REALITY CHECK
-If no sold comps exist, search current retail (Amazon, Walmart, manufacturer site).
-- Used resale = 55% to 70% of current retail price (brand-dependent).
-- New/sealed resale = 75% to 85% of current retail price.
-- CRITICAL: Secondary market value CANNOT exceed current retail price.
-- If Tier 2 data found: SET pricing_tier="RETAIL_ANCHORED" and STOP HERE.
+Search Amazon, Walmart, manufacturer site.
+- Used resale = 55-70% of retail. New = 75-85% of retail.
+- CRITICAL for MODEL A only: resale CANNOT exceed retail.
+- If Tier 2 found: SET pricing_tier="RETAIL_ANCHORED" and STOP.
+
+TIER 3 — INDUSTRIAL DEALERS
+Grainger, MSC, Radwell for specialty items.
+- Used = 50-60% of dealer price. New = 70-80%.
+- If Tier 3 found: SET pricing_tier="DEALER_DISCOUNTED" and STOP.
+
+IF MODEL B (Collectible/Hype):
+TIER 1 — SOLD COMPS ONLY (Mandatory)
+Search eBay sold, StockX, Heritage Auctions, PWCC for recent sales.
+- Extract minimum 3 comparable data points. Discard fakes/condition anomalies. Average the rest.
+- DO NOT use retail as a ceiling. Secondary market price IS the true value.
+- If Tier 1 found: SET pricing_tier="SOLD_COMPS" and STOP.
+- SKIP Tier 2 entirely — retail is irrelevant for collectibles.
+
+TIER 4 — ACTIVE LISTINGS (Last resort, both models)
+Only if Tiers 1-3 completely fail.
+- Take LOWEST active listing × 0.60.
+- SET pricing_tier="ACTIVE_LISTINGS".
 
 TIER 3 — INDUSTRIAL/SPECIALTY DEALERS
 For specialized items with no retail or sold comps (Grainger, MSC, Radwell, surplus sites).
@@ -389,10 +414,16 @@ Consumer Electronics: 293, Clothing: 11450, Tools: 631, Toys: 220, Collectibles:
 PLCs: 115708, Sensors: 78189, Hydraulic valves: 98463, Pumps: 12576
 Motors: 124660, VFDs: 115082, Circuit breakers: 66825, Contactors: 66828
 
+=== PHASE 4: AGGREGATION RULES ===
+- Never anchor to a single price. Extract minimum 3 data points.
+- For MODEL B: if price spread exceeds 3x (e.g. $100 to $300+), flag requires_manual_review=true.
+- USED and NEW prices must be researched separately.
+- Always provide BOTH price_used AND price_new. Estimate missing one: used = new × 0.65.
+
 OUTPUT — Return ONLY raw JSON, no markdown:
 
 {{
-  "title": "Improved eBay title under 80 chars",
+  "title": "Specific eBay title under 80 chars — include brand, exact model/variant, size, year if known",
   "ebay_category": "Full category path",
   "ebay_category_id": <number>,
   "weight_oz": <number>,
@@ -404,7 +435,12 @@ OUTPUT — Return ONLY raw JSON, no markdown:
   "price_new_high": <number>,
   "price_new": <number>,
   "pricing_tier": "SOLD_COMPS" or "RETAIL_ANCHORED" or "DEALER_DISCOUNTED" or "ACTIVE_LISTINGS" or "ESTIMATED",
-  "data_sources_count": <number>
+  "data_sources_count": <number>,
+  "economic_model": "MODEL_A" or "MODEL_B",
+  "is_ambiguous": true or false,
+  "confidence_score": <number 1-100>,
+  "requires_manual_review": true or false,
+  "review_reason": "string or empty"
 }}
 """
 
