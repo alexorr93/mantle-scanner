@@ -997,6 +997,7 @@ CHAIN OF THOUGHT: Fill raw_text_read first, then verified_brand, then verified_p
         "mpn":              verified_pn if verified_pn and verified_pn != "UNKNOWN" else None,
         "model":            verified_pn if verified_pn and verified_pn != "UNKNOWN" else None,
         "ebay_item_specifics": ebay_item_specifics if ebay_item_specifics else None,
+        "sku": group.get("batch_name") or None,
     }).execute()
 
     supabase.table("listing_groups").update({"status": "done"}).eq("id", group_id).execute()
