@@ -487,8 +487,10 @@ def _fill_aspects_at_scan(title: str, brand: str, part_number: str, category_id:
     aspects = {}
     try:
         # Get app-level token
-        import base64 as _b64
-        creds = _b64.b64encode(f"{EBAY_APP_ID}:{EBAY_CERT_ID}".encode()).decode()
+        import base64 as _b64, os as _os
+        _app_id = EBAY_APP_ID if 'EBAY_APP_ID' in dir() else _os.getenv("EBAY_APP_ID", "")
+        _cert_id = _os.getenv("EBAY_CERT_ID", "")
+        creds = _b64.b64encode(f"{_app_id}:{_cert_id}".encode()).decode()
         tok_r = _rq.post(
             "https://api.ebay.com/identity/v1/oauth2/token",
             headers={"Authorization": f"Basic {creds}", "Content-Type": "application/x-www-form-urlencoded"},
