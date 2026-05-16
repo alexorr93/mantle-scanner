@@ -965,6 +965,7 @@ CHAIN OF THOUGHT: Fill raw_text_read first, then verified_brand, then verified_p
         price_used = price_used_low = price_used_high = 0.00
         price_new  = price_new_low  = price_new_high  = 0.00
         active_price = active_low = active_high = 0.00
+        ebay_item_specifics = {}
 
     # Sold count: prefer eBay API data, fall back to Gemini's web-search confirmation
     api_sc = (len(ebay_data.get("sold_used", []) or []) + len(ebay_data.get("sold_new", []) or [])) if isinstance(ebay_data, dict) else 0
