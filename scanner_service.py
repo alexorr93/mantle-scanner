@@ -884,10 +884,8 @@ CHAIN OF THOUGHT: Fill raw_text_read first, then verified_brand, then verified_p
                 response = client.models.generate_content(model=model, contents=[*image_parts, prompt], config=cfg)
                 raw = extract_text(response)
                 raw = (raw or "").strip()
-                raw = re.sub(r"^```[a-z]*
-?", "", raw, flags=re.IGNORECASE)
-                raw = re.sub(r"
-?```$", "", raw).strip()
+                raw = re.sub(r"^```[a-zA-Z]*", "", raw).strip()
+                raw = re.sub(r"```$", "", raw).strip()
             if not raw:
                 raise Exception("Gemini returned empty response after retries")
         data             = json.loads(raw)
