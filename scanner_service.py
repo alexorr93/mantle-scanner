@@ -877,6 +877,19 @@ CHAIN OF THOUGHT: Fill raw_text_read first, then verified_brand, then verified_p
         raw = re.sub(r"^```[a-z]*\n?", "", raw, flags=re.IGNORECASE)
         raw = re.sub(r"\n?```$", "", raw).strip()
 
+        if not raw:
+            if _attempt < 2:
+                print(f"   ⚠️  Gemini returned empty response, retrying ({_attempt+1}/3)...")
+                time.sleep(5)
+                response = client.models.generate_content(model=model, contents=[*image_parts, prompt], config=cfg)
+                raw = extract_text(response)
+                raw = (raw or "").strip()
+                raw = re.sub(r"^```[a-z]*
+?", "", raw, flags=re.IGNORECASE)
+                raw = re.sub(r"
+?```$", "", raw).strip()
+            if not raw:
+                raise Exception("Gemini returned empty response after retries")
         data             = json.loads(raw)
         title            = str(data.get("title", "Unknown Item")).strip()[:80]
         ebay_category    = str(data.get("ebay_category", "")).strip()
