@@ -608,6 +608,12 @@ CRITICAL RULES:
         price_new        = parse_num(data.get("price_new", 0))
 
         # ---- eBay Category Suggestion API ----
+        # This business only ever sells in Business & Industrial or eBay Motors — full stop.
+        # Lock to a safe default up front so ANY failure path (API error, no match, timeout)
+        # still lands in an allowed category, never Gemini's unrestricted raw guess.
+        ebay_category_id = "26261"  # Other Business & Industrial
+        ebay_category = "Other Business & Industrial"
+        ALLOWED_CATEGORY_ROOTS = ("business & industrial", "ebay motors")
         if title and title != "Unknown Item" and EBAY_APP_ID:
             try:
                 import requests as _req
@@ -622,11 +628,27 @@ CRITICAL RULES:
                 )
                 if cat_resp.status_code == 200:
                     suggestions = cat_resp.json().get("categorySuggestions", [])
-                    if suggestions:
-                        best = suggestions[0]["category"]
+                    chosen = None
+                    for s in suggestions:
+                        ancestors = s.get("categoryTreeNodeAncestors", []) or []
+                        names = [a.get("categoryName", "").lower() for a in ancestors]
+                        names.append(s.get("category", {}).get("categoryName", "").lower())
+                        if any(root in n for n in names for root in ALLOWED_CATEGORY_ROOTS):
+                            chosen = s
+                            break
+                    if chosen:
+                        best = chosen["category"]
                         ebay_category_id = str(best.get("categoryId", ebay_category_id))
                         ebay_category    = best.get("categoryName", ebay_category)
                         print(f"   📂 eBay category: {ebay_category} (ID: {ebay_category_id})")
+                    else:
+                        # Every item this business sells belongs in one of these two roots,
+                        # no exceptions — fall back to a safe default within Business &
+                        # Industrial rather than ever leaving/setting an unrelated category.
+                        ebay_category_id = "26261"  # Other Business & Industrial
+                        ebay_category = "Other Business & Industrial"
+                        print(f"   ⚠️  No Business & Industrial / eBay Motors match among "
+                              f"{len(suggestions)} suggestion(s) — locked to default category {ebay_category_id}")
             except Exception as _ce:
                 print(f"   ⚠️  Category lookup failed: {_ce}")
 
