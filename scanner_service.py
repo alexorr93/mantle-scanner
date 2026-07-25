@@ -403,8 +403,11 @@ def process_group(group: dict):
     group_id  = group["id"]
     condition = group.get("condition", "used")
     quantity  = group.get("quantity", 1)
+    category_mode = group.get("category_mode", "industrial")
+    if category_mode not in ("industrial", "motors"):
+        category_mode = "industrial"
 
-    print(f"\n📦 Processing group {group_id} — condition: {condition}, qty: {quantity}")
+    print(f"\n📦 Processing group {group_id} — condition: {condition}, qty: {quantity}, category_mode: {category_mode}")
 
     supabase.table("listing_groups").update(
         {"status": "processing"}
@@ -608,69 +611,72 @@ CRITICAL RULES:
         price_new        = parse_num(data.get("price_new", 0))
 
         # ---- eBay Category Suggestion API ----
-        # This business only ever sells in Business & Industrial or eBay Motors — full stop.
-        # Lock to a safe default up front so ANY failure path (API error, no match, timeout)
-        # still lands in an allowed category, never Gemini's unrestricted raw guess.
-        ebay_category_id = "26261"  # Other Business & Industrial
-        ebay_category = "Other Business & Industrial"
-        ALLOWED_CATEGORY_ROOTS = ("business & industrial", "ebay motors")
+        # Single lane, decided by the intake toggle (category_mode, read off the
+        # group above). No cross-tree fallback: an item marked Auto Parts stays in
+        # tree 100 and lands on the Motors catch-all if nothing matches, rather than
+        # silently drifting into Business & Industrial. The old version queried both
+        # trees but appended tree 0 first and took the first acceptable hit, which
+        # made tree 100 unreachable in practice for anything tree 0 could answer.
+        MOTORS_FALLBACK_ID = os.environ.get("EBAY_DEFAULT_MOTORS_CATEGORY_ID", "").strip()
+        if category_mode == "motors":
+            _tree_id = "100"
+            ebay_category_id = MOTORS_FALLBACK_ID or "26261"
+            ebay_category = "Other (eBay Motors)" if MOTORS_FALLBACK_ID else "Other Business & Industrial"
+            if not MOTORS_FALLBACK_ID:
+                print("   ⚠️  EBAY_DEFAULT_MOTORS_CATEGORY_ID env var not set on mantle-scanner "
+                      "— Auto Parts misses will land on 26261 instead of the Motors catch-all.")
+        else:
+            _tree_id = "0"
+            ebay_category_id = "26261"  # Other Business & Industrial
+            ebay_category = "Other Business & Industrial"
+
         if title and title != "Unknown Item" and EBAY_APP_ID:
             try:
                 import requests as _req
                 token = get_ebay_token()
-                # eBay Motors is tree 100 — a genuinely SEPARATE category tree from the
-                # standard US marketplace (tree 0), not a branch inside it. Tree 0 alone
-                # contains zero "Motors" categories, so every auto part was guaranteed to
-                # miss every match and fall through to the generic Business & Industrial
-                # default below, regardless of how good the title was. Query both trees.
-                suggestions = []
-                for tree_id, tree_label in (("0", "standard"), ("100", "motors")):
-                    cat_resp = _req.get(
-                        f"https://api.ebay.com/commerce/taxonomy/v1/category_tree/{tree_id}/get_category_suggestions",
-                        params={"q": title},
-                        headers={
-                            "Authorization": f"Bearer {token}",
-                            "Content-Type": "application/json"
-                        },
-                        timeout=5
-                    )
-                    if cat_resp.status_code == 200:
-                        for s in cat_resp.json().get("categorySuggestions", []):
-                            s["_tree"] = tree_id
-                            suggestions.append(s)
-                    else:
-                        print(f"   ⚠️  Category tree {tree_label} lookup returned {cat_resp.status_code}: {cat_resp.text[:200]}")
-
-                chosen = None
-                for s in suggestions:
-                    # Tree 100 IS eBay Motors by definition — no name matching needed,
-                    # and this avoids the earlier false-positive bug where substring
-                    # matching on "Motors"/"Parts & Accessories" caught unrelated
-                    # categories (e.g. lawnmower motors under Home & Garden).
-                    if s.get("_tree") == "100":
-                        chosen = s
-                        break
-                    ancestors = s.get("categoryTreeNodeAncestors", []) or []
-                    top_level_name = (ancestors[0].get("categoryName", "") if ancestors
-                                       else s.get("category", {}).get("categoryName", "")).lower()
-                    if top_level_name == "business & industrial":
-                        chosen = s
-                        break
-                if chosen:
-                    best = chosen["category"]
-                    ebay_category_id = str(best.get("categoryId", ebay_category_id))
-                    ebay_category    = best.get("categoryName", ebay_category)
-                    print(f"   📂 eBay category: {ebay_category} (ID: {ebay_category_id}, tree {chosen.get('_tree')})")
+                cat_resp = _req.get(
+                    f"https://api.ebay.com/commerce/taxonomy/v1/category_tree/{_tree_id}/get_category_suggestions",
+                    params={"q": title},
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": "application/json"
+                    },
+                    timeout=5
+                )
+                if cat_resp.status_code != 200:
+                    print(f"   ⚠️  Category tree {_tree_id} lookup returned "
+                          f"{cat_resp.status_code}: {cat_resp.text[:200]}")
                 else:
-                    # Every item this business sells belongs in one of these two roots,
-                    # no exceptions — fall back to a safe default within Business &
-                    # Industrial rather than ever leaving/setting an unrelated category.
-                    ebay_category_id = "26261"  # Other Business & Industrial
-                    ebay_category = "Other Business & Industrial"
-                    print(f"   ⚠️  No Business & Industrial / eBay Motors match among "
-                          f"{len(suggestions)} suggestion(s) — locked to default category {ebay_category_id}")
+                    chosen = None
+                    for s in cat_resp.json().get("categorySuggestions", []):
+                        if _tree_id == "100":
+                            # Tree 100 IS eBay Motors by definition — no name check needed.
+                            chosen = s
+                            break
+                        ancestors = s.get("categoryTreeNodeAncestors", []) or []
+                        # NOTE: eBay returns ancestors nearest-parent-first, so the ROOT
+                        # (top-level) category is the LAST element, not the first. The
+                        # previous version read ancestors[0] here, which is the item's
+                        # immediate parent — comparing that against "Business & Industrial"
+                        # almost never matched, silently rejecting most valid B&I results
+                        # and pushing them to the 26261 fallback below.
+                        top_level_name = (ancestors[-1].get("categoryName", "") if ancestors
+                                           else s.get("category", {}).get("categoryName", "")).lower()
+                        if top_level_name == "business & industrial":
+                            chosen = s
+                            break
+                    if chosen:
+                        best = chosen["category"]
+                        ebay_category_id = str(best.get("categoryId", ebay_category_id))
+                        ebay_category    = best.get("categoryName", ebay_category)
+                        print(f"   📂 eBay category: {ebay_category} (ID: {ebay_category_id}, "
+                              f"tree {_tree_id}, mode {category_mode})")
+                    else:
+                        print(f"   ⚠️  No match in tree {_tree_id} (mode {category_mode}) — "
+                              f"locked to catch-all category {ebay_category_id}")
             except Exception as _ce:
                 print(f"   ⚠️  Category lookup failed: {_ce}")
+
 
         if condition == "used":
             active_price = price_used if price_used > 0 else price_new
@@ -696,6 +702,7 @@ CRITICAL RULES:
         "title":            title,
         "ebay_category":    ebay_category,
         "ebay_category_id": ebay_category_id,
+        "category_mode":    category_mode,
         "weight_oz":        weight_oz,
         "weight_lb":        weight_lb,
         "price_low":        active_low,
