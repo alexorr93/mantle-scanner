@@ -425,6 +425,17 @@ def process_group(group: dict):
     category_mode = group.get("category_mode", "industrial")
     if category_mode not in ("industrial", "motors"):
         category_mode = "industrial"
+    business_id = group.get("business_id")
+    if not business_id:
+        # Without this the listing insert lands with business_id=NULL, which makes
+        # it permanently invisible to the web app's /api/listings query (it filters
+        # .eq("business_id", business_id) — a null row can never match). Confirmed
+        # this actually happened: two real, fully-processed scans (RÖHM live center,
+        # Spicer U-joint) sat in the listings table forever with business_id=NULL
+        # because nothing ever set it explicitly and whatever DB-side default/trigger
+        # was supposed to fill it in didn't. Log loudly rather than silently proceed.
+        print(f"   ⚠️  group {group_id} has no business_id — the listing this creates "
+              f"will not be visible in the web app until this is fixed.")
 
     print(f"\n📦 Processing group {group_id} — condition: {condition}, qty: {quantity}, category_mode: {category_mode}")
 
@@ -722,6 +733,7 @@ CRITICAL RULES:
         "ebay_category":    ebay_category,
         "ebay_category_id": ebay_category_id,
         "category_mode":    category_mode,
+        "business_id":      business_id,
         "weight_oz":        weight_oz,
         "weight_lb":        weight_lb,
         "price_low":        active_low,
