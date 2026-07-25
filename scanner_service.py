@@ -717,7 +717,7 @@ CRITICAL RULES:
         price_new  = price_new_low  = price_new_high  = 0.00
         active_price = active_low = active_high = 0.00
 
-    supabase.table("listings").insert({
+    _listing_payload = {
         "title":            title,
         "ebay_category":    ebay_category,
         "ebay_category_id": ebay_category_id,
@@ -735,7 +735,25 @@ CRITICAL RULES:
         "condition":        condition,
         "status":           "scanned",
         "created_at":       scanned_at,
-    }).execute()
+    }
+    try:
+        _ins_res = supabase.table("listings").insert(_listing_payload).execute()
+        if not getattr(_ins_res, "data", None):
+            raise Exception(f"insert returned no data: {_ins_res}")
+    except Exception as _ins_err:
+        # Most likely cause of a silent-looking failure right after a migration:
+        # PostgREST's schema cache hasn't picked up a newly added column yet
+        # (category_mode), so it rejects the whole insert. Retry once without
+        # it rather than losing the scan entirely — this listing just won't
+        # carry its mode until the cache catches up or the next rescan.
+        print(f"   ⚠️  listings insert failed ({_ins_err}) — retrying without category_mode "
+              f"in case the column isn't in PostgREST's schema cache yet")
+        _listing_payload.pop("category_mode", None)
+        _ins_res2 = supabase.table("listings").insert(_listing_payload).execute()
+        if not getattr(_ins_res2, "data", None):
+            print(f"   ❌ listings insert failed again — this scan's listing was NOT created: {_ins_res2}")
+            supabase.table("listing_groups").update({"status": "error"}).eq("id", group_id).execute()
+            return
 
     supabase.table("listing_groups").update({"status": "done"}).eq("id", group_id).execute()
 
