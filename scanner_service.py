@@ -326,14 +326,26 @@ def fetch_ebay_prices(title: str) -> dict:
 #  GEMINI PROMPT
 # ------------------------------------------------------------------ #
 
-def make_prompt(photo_count: int, condition: str = "used", ebay_data: dict = None, id_title: str = "") -> str:
+def make_prompt(photo_count: int, condition: str = "used", ebay_data: dict = None,
+                 id_title: str = "", allow_search: bool = True) -> str:
     ebay_section = ""
     if ebay_data and ebay_data.get("has_data"):
-        ebay_section = f"""
+        if allow_search:
+            ebay_section = f"""
 {ebay_data["summary"]}
 
 Use the eBay market data above as your PRIMARY source for pricing.
 Also use Google Search to verify and supplement with additional sold listings.
+Prioritize sold listings over active listings for pricing accuracy.
+"""
+        else:
+            # API-first mode: eBay's API already returned real sold/active data, so
+            # skip the search-and-verify pass entirely — just use what's given.
+            ebay_section = f"""
+{ebay_data["summary"]}
+
+Use ONLY the eBay market data above for pricing — it is real sold/active data from
+eBay's own API. Do not search the web to verify it. Just use these numbers directly.
 Prioritize sold listings over active listings for pricing accuracy.
 """
     else:
@@ -425,6 +437,9 @@ def process_group(group: dict):
     category_mode = group.get("category_mode", "industrial")
     if category_mode not in ("industrial", "motors"):
         category_mode = "industrial"
+    pricing_mode = group.get("pricing_mode", "always_search")
+    if pricing_mode not in ("always_search", "api_first"):
+        pricing_mode = "always_search"
     business_id = group.get("business_id")
     if not business_id:
         # Without this the listing insert lands with business_id=NULL, which makes
@@ -579,18 +594,28 @@ CRITICAL RULES:
             print(f"   ⚠️  eBay API unavailable — Gemini will search eBay + web directly")
 
     # ---- STEP 3: Full Gemini pass with real eBay data injected ----
-    prompt = make_prompt(len(image_parts), condition, ebay_data, id_title=title_for_ebay)
-    # Always use Google Search — it finds eBay sold listings, Amazon, and other
-    # marketplaces regardless of whether the eBay API succeeded or failed
-    use_search = True
-    print(f"   🤖 Step 3: Gemini pricing pass (web search: always on)...")
+    ebay_has_data = bool(ebay_data.get("has_data"))
+    # always_search (default, unchanged behavior): always cross-check via Google
+    # Search regardless of whether the eBay API succeeded — catches Amazon/Reverb/
+    # Facebook Marketplace comps a structured eBay-only query would miss.
+    # api_first (new, opt-in toggle): if the eBay API already returned real
+    # sold+active data, trust it and skip the search-and-verify pass entirely —
+    # this is the slow step, so skipping it when we already have good data is the
+    # whole point of this mode.
+    use_search = True if pricing_mode == "always_search" else (not ebay_has_data)
+    prompt = make_prompt(len(image_parts), condition, ebay_data, id_title=title_for_ebay,
+                          allow_search=use_search)
+    print(f"   🤖 Step 3: Gemini pricing pass (mode: {pricing_mode}, "
+          f"web search: {'on' if use_search else 'skipped — trusting eBay API data'})...")
 
     try:
-        cfg = types.GenerateContentConfig(
-            tools=[types.Tool(google_search=types.GoogleSearch())],
+        cfg_kwargs = dict(
             temperature=0.1,
             system_instruction="You are an expert industrial parts resale pricing specialist. You identify parts precisely from photos, search eBay for real sold prices, and return accurate structured data. Never guess manufacturer names — only state brands you can read on the part."
         )
+        if use_search:
+            cfg_kwargs["tools"] = [types.Tool(google_search=types.GoogleSearch())]
+        cfg = types.GenerateContentConfig(**cfg_kwargs)
         response = None
         for _attempt in range(3):
             try:
@@ -733,6 +758,8 @@ CRITICAL RULES:
         "ebay_category":    ebay_category,
         "ebay_category_id": ebay_category_id,
         "category_mode":    category_mode,
+        "pricing_mode":     pricing_mode,
+        "pricing_used_search": use_search,
         "business_id":      business_id,
         "weight_oz":        weight_oz,
         "weight_lb":        weight_lb,
@@ -761,6 +788,8 @@ CRITICAL RULES:
         print(f"   ⚠️  listings insert failed ({_ins_err}) — retrying without category_mode "
               f"in case the column isn't in PostgREST's schema cache yet")
         _listing_payload.pop("category_mode", None)
+        _listing_payload.pop("pricing_mode", None)
+        _listing_payload.pop("pricing_used_search", None)
         _ins_res2 = supabase.table("listings").insert(_listing_payload).execute()
         if not getattr(_ins_res2, "data", None):
             print(f"   ❌ listings insert failed again — this scan's listing was NOT created: {_ins_res2}")
