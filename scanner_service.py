@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import concurrent.futures
 from pydantic import BaseModel, Field
 import json
 import io
@@ -11,6 +12,24 @@ from google import genai
 from google.genai import types
 from PIL import Image
 from PIL.ExifTags import TAGS
+
+# Real Railway service and confirmed the actual mechanism: a stalled Gemini
+# response (not a clean error, just never returning) blocks this ENTIRE
+# service, since process_group() runs groups one at a time in a single
+# sequential loop. Nothing else in the queue -- no matter how new -- gets
+# picked up until the stuck call finally resolves. Confirmed via real data:
+# a group stuck since 15:47 blocked every single scan after it for the rest
+# of the day. This wraps any Gemini call in a hard timeout, enforced by this
+# code regardless of what timeout (if any) the SDK's own HTTP client uses
+# internally, so a stall can never freeze the whole worker again.
+_gemini_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+
+def call_gemini_with_timeout(fn, timeout_seconds=90):
+    future = _gemini_pool.submit(fn)
+    try:
+        return future.result(timeout=timeout_seconds)
+    except concurrent.futures.TimeoutError:
+        raise Exception(f"Gemini call did not respond within {timeout_seconds}s (stalled, not a clean error)")
 
 # ------------------------------------------------------------------ #
 #  SETUP
@@ -545,7 +564,7 @@ CRITICAL RULES:
         id_resp = None
         for _attempt in range(3):
             try:
-                id_resp = client.models.generate_content(
+                id_resp = call_gemini_with_timeout(lambda: client.models.generate_content(
                     model=id_model,
                     contents=[*image_parts, id_prompt],
                     config=types.GenerateContentConfig(
@@ -554,11 +573,13 @@ CRITICAL RULES:
                         response_mime_type="application/json",
                         response_schema=PartIdentification,
                     )
-                )
+                ))
                 break
             except Exception as _e:
                 err = str(_e)
-                if "503" in err or "UNAVAILABLE" in err or "429" in err:
+                if "did not respond within" in err:
+                    print(f"   \u23f3 Gemini stalled, retrying...")
+                elif "503" in err or "UNAVAILABLE" in err or "429" in err:
                     print(f"   \u23f3 Gemini Pro busy, retrying in 15s...")
                     time.sleep(15)
                 elif "404" in err or "deprecated" in err.lower() or "429" in err or "quota" in err.lower() or "RESOURCE_EXHAUSTED" in err:
@@ -619,14 +640,16 @@ CRITICAL RULES:
         response = None
         for _attempt in range(3):
             try:
-                response = client.models.generate_content(
+                response = call_gemini_with_timeout(lambda: client.models.generate_content(
                     model=model,
                     contents=[*image_parts, prompt],
                     config=cfg
-                )
+                ), timeout_seconds=150)  # longer -- this pass does real web/eBay research via Google Search grounding
                 break
             except Exception as _e:
-                if "503" in str(_e) or "UNAVAILABLE" in str(_e):
+                if "did not respond within" in str(_e):
+                    print(f"   ⏳ Gemini stalled, retrying...")
+                elif "503" in str(_e) or "UNAVAILABLE" in str(_e):
                     print(f"   ⏳ Gemini busy, retrying in 10s (attempt {_attempt+1}/3)...")
                     time.sleep(10)
                 else:
@@ -828,13 +851,13 @@ def process_legacy_photo(file_info):
         image_part = types.Part.from_bytes(data=jpeg_bytes, mime_type="image/jpeg")
         prompt     = make_prompt(1, "used")
 
-        response = client.models.generate_content(
+        response = call_gemini_with_timeout(lambda: client.models.generate_content(
             model=model,
             contents=[image_part, prompt],
             config=types.GenerateContentConfig(
                 tools=[types.Tool(google_search=types.GoogleSearch())]
             )
-        )
+        ), timeout_seconds=150)
 
         # response.text can be None when Google Search tool is used
         def extract_text(resp):
