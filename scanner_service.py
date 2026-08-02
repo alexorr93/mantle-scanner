@@ -849,7 +849,13 @@ def process_legacy_photo(file_info):
         mark_seen(photo_id)
 
         image_part = types.Part.from_bytes(data=jpeg_bytes, mime_type="image/jpeg")
-        prompt     = make_prompt(1, "used")
+        condition  = "used"  # legacy single-photo path has no condition input -- always "used", same
+                              # default make_prompt itself uses. Previously passed directly into
+                              # make_prompt() without ever being saved to a real variable, so the later
+                              # listings insert (which references `condition` by name) raised a bare
+                              # NameError on every legacy scan -- hidden until now behind the billing
+                              # 403s, which killed every request before this code ever ran.
+        prompt     = make_prompt(1, condition)
 
         response = call_gemini_with_timeout(lambda: client.models.generate_content(
             model=model,
