@@ -960,9 +960,16 @@ while True:
         for group in (pending.data or []):
             process_group(group)
 
-        # 3. Check for legacy single photos
+        # 3. Check for legacy single photos. Interleave a pending-groups check
+        # every few legacy photos -- a large legacy backlog (this can run for
+        # many minutes/hours straight) would otherwise starve real, current
+        # group scans entirely, since nothing re-checked "pending" until this
+        # whole for-loop finished. Confirmed this actually happened: a full
+        # deploy ran 4+ minutes processing legacy photos non-stop without
+        # ever once touching a "Processing group" call, while a real pending
+        # group sat waiting the entire time.
         current = supabase.storage.from_("part-photos").list()
-        for f in current:
+        for _legacy_idx, f in enumerate(current):
             if f['name'] not in seen_files:
                 # Check if this photo belongs to a group
                 group_check = (
@@ -976,6 +983,20 @@ while True:
                 else:
                     # Part of a group — just mark as seen
                     mark_seen(f['name'])
+
+                # Interleaved check, every 3 legacy photos rather than every
+                # single one (keeps the extra query overhead low while still
+                # keeping real group scans from waiting an unbounded amount
+                # of time behind a large legacy backlog).
+                if (_legacy_idx + 1) % 3 == 0:
+                    interleaved_pending = (
+                        supabase.table("listing_groups")
+                        .select("*")
+                        .eq("status", "pending")
+                        .execute()
+                    )
+                    for group in (interleaved_pending.data or []):
+                        process_group(group)
 
     except Exception as _err:
         print(f"⚠️  Connection hiccup: {_err}")
