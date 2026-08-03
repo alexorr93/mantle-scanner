@@ -489,9 +489,19 @@ def process_group(group: dict):
 
     print(f"\n📦 Processing group {group_id} — condition: {condition}, qty: {quantity}, category_mode: {category_mode}")
 
-    supabase.table("listing_groups").update(
-        {"status": "processing"}
-    ).eq("id", group_id).execute()
+    # ATOMIC claim -- root cause of the duplicate-listings bug: two scanner
+    # instances (production env + Input env) poll the same table, and a plain
+    # unconditional update let both "claim" the same pending group. This update
+    # only succeeds if the row is STILL pending -- Postgres guarantees exactly
+    # one caller wins; the loser gets zero rows back and bails immediately.
+    _claim = (supabase.table("listing_groups")
+              .update({"status": "processing"})
+              .eq("id", group_id)
+              .eq("status", "pending")
+              .execute())
+    if not (_claim.data or []):
+        print(f"   ⏭️  Group {group_id} already claimed by another scanner instance -- skipping")
+        return
 
     # Idempotency guard -- confirmed via real duplicate listings (same photo_id,
     # same created_at, but two separate rows) that a group can end up getting
