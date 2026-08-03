@@ -477,6 +477,23 @@ def process_group(group: dict):
         {"status": "processing"}
     ).eq("id", group_id).execute()
 
+    # Idempotency guard -- confirmed via real duplicate listings (same photo_id,
+    # same created_at, but two separate rows) that a group can end up getting
+    # processed a second time by something that resets/re-queues it, and each
+    # run creates its own independent listing. Rather than chase down every
+    # possible way that reset could happen, this closes the actual symptom
+    # directly: before doing any real work, check whether this group's own
+    # photos already produced a listing, and bail out cleanly if so.
+    _group_photo_ids = [gp["photo_id"] for gp in
+                         (supabase.table("group_photos").select("photo_id").eq("group_id", group_id).execute().data or [])]
+    if _group_photo_ids:
+        _already = (supabase.table("listings").select("id")
+                    .in_("photo_id", _group_photo_ids).limit(1).execute().data)
+        if _already:
+            print(f"   ⏭️  Group {group_id} already produced listing {_already[0]['id']} -- skipping duplicate processing")
+            supabase.table("listing_groups").update({"status": "done"}).eq("id", group_id).execute()
+            return
+
     photos_result = (
         supabase.table("group_photos")
         .select("*")
@@ -847,6 +864,13 @@ def process_legacy_photo(file_info):
         # Mark both as seen immediately
         mark_seen(old_name)
         mark_seen(photo_id)
+
+        # Same idempotency guard as process_group -- if this exact photo
+        # already produced a listing somehow, don't create a second one.
+        _already = supabase.table("listings").select("id").eq("photo_id", photo_id).limit(1).execute().data
+        if _already:
+            print(f"   ⏭️  {photo_id} already produced listing {_already[0]['id']} -- skipping duplicate processing")
+            return
 
         image_part = types.Part.from_bytes(data=jpeg_bytes, mime_type="image/jpeg")
         condition  = "used"  # legacy single-photo path has no condition input -- always "used", same
