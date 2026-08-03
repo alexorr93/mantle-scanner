@@ -139,13 +139,29 @@ def to_jpeg_bytes(raw_bytes: bytes) -> bytes:
     img.save(buf, format="JPEG", quality=92)
     return buf.getvalue()
 
-def build_new_filename(dt: datetime, original_name: str) -> str:
+def _parse_photo_idx(photo_id: str):
+    """Photos written by main.py's /api/photos/upload carry their original
+    capture/selection order as a trailing _<idx> before the extension (e.g.
+    030826_143022_3.jpg — see the batch_ts fix there). Returns None for
+    anything that doesn't match (legacy single-photo scans, _extra add-on
+    photos added post-scan), which callers should treat as unordered."""
+    m = re.search(r'_(\d+)\.[^.]+$', str(photo_id or ""))
+    return int(m.group(1)) if m else None
+
+def build_new_filename(dt: datetime, original_name: str, idx: int = None) -> str:
     date_code = dt.strftime("%d%m%y")
     time_code = datetime.now().strftime("%H%M%S")
     ext = os.path.splitext(original_name)[1].lower()
     if ext not in (".jpg", ".jpeg", ".png", ".heic"):
         ext = ".jpg"
-    return f"{date_code}_{time_code}{ext}"
+    # Re-embed idx (when the caller has one) so the renamed/final filename keeps
+    # carrying real photo order downstream -- without this, process_group's own
+    # ordering fix above would only hold during this one run, since every photo
+    # gets renamed to a fresh filename right after order is determined, and
+    # anything reading photo order afterward (e.g. main.py's get_all_photo_ids)
+    # would be right back to no ordering info to sort on.
+    suffix = f"_{idx}" if idx is not None else ""
+    return f"{date_code}_{time_code}{suffix}{ext}"
 
 def rename_in_supabase(raw_bytes: bytes, old_name: str, new_name: str) -> bool:
     try:
@@ -507,7 +523,21 @@ def process_group(group: dict):
         supabase.table("listing_groups").update({"status": "error"}).eq("id", group_id).execute()
         return
 
-    photo_records = photos_result.data
+    # Real bug this fixes: uploaded_at is a DB insert timestamp, which reflects
+    # completion order of concurrent uploads, not original capture/selection
+    # order -- since main.py's per-item concurrency fix, photos within one item
+    # upload in parallel, so whichever happened to land first got treated as
+    # position 0 (and therefore became the primary/profile photo) essentially
+    # at random. main.py's /api/photos/upload already embeds the real order as
+    # a trailing _<idx> in the filename itself -- sort on that when present,
+    # falling back to uploaded_at only for older-format filenames from before
+    # that fix existed.
+    photo_records = sorted(
+        photos_result.data,
+        key=lambda r: (0, _parse_photo_idx(r["photo_id"]))
+                       if _parse_photo_idx(r["photo_id"]) is not None
+                       else (1, r.get("uploaded_at") or "")
+    )
     print(f"   📸 Found {len(photo_records)} photos")
 
     image_parts  = []
@@ -520,10 +550,10 @@ def process_group(group: dict):
             raw_bytes = supabase.storage.from_("part-photos").download(old_name)
             if i == 0:
                 dt, scanned_at = get_exif_date(raw_bytes)
-                new_name = build_new_filename(dt, old_name)
+                new_name = build_new_filename(dt, old_name, idx=i)
             else:
                 dt       = datetime.now()
-                new_name = build_new_filename(dt, old_name)
+                new_name = build_new_filename(dt, old_name, idx=i)
 
             jpeg_bytes = to_jpeg_bytes(raw_bytes)
             renamed    = rename_in_supabase(jpeg_bytes, old_name, new_name)
