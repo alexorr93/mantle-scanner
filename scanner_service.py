@@ -595,6 +595,7 @@ def process_group(group: dict):
         return
 
     # ---- STEP 1: Structured ID pass using Pydantic schema ----
+    _verified_mpn = ""
     print(f"   \U0001f50d Step 1: Identifying item from photos...")
     title_for_ebay = ""
     try:
@@ -647,6 +648,7 @@ CRITICAL RULES:
         if id_resp is None:
             raise Exception("Gemini unavailable after 3 retries")
         parsed_data    = json.loads(id_resp.text)
+        _verified_mpn  = (parsed_data.get("verified_part_number") or "").strip()
         title_for_ebay = parsed_data.get("generated_title", "").strip()
         text_found     = parsed_data.get("raw_text_read", "").strip()
         print(f"   \U0001f4dd Text found:   {text_found[:100]}")
@@ -854,6 +856,9 @@ CRITICAL RULES:
         "condition":        condition,
         "status":           "scanned",
         "created_at":       scanned_at,
+        # Real part number read off the photo by the ID pass — previously discarded,
+        # which left MPN blank for every numeric-only OEM part number.
+        "mpn":              (_verified_mpn if _verified_mpn and _verified_mpn.upper() != "UNKNOWN" else None),
     }
     try:
         _ins_res = supabase.table("listings").insert(_listing_payload).execute()
