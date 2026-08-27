@@ -809,8 +809,46 @@ CRITICAL RULES:
                         print(f"   📂 eBay category: {ebay_category} (ID: {ebay_category_id}, "
                               f"tree {_tree_id}, mode {category_mode})")
                     else:
-                        print(f"   ⚠️  No match in tree {_tree_id} (mode {category_mode}) — "
-                              f"locked to catch-all category {ebay_category_id}")
+                        # Retry with simplified title — strip model/part numbers that
+                        # overwhelm eBay's suggestion engine
+                        import re
+                        simplified = re.sub(r'\b[A-Z0-9]{2,}-[\w-]+\b', '', title)
+                        simplified = re.sub(r'\b\d+:\d+\b', '', simplified)
+                        simplified = re.sub(r'\b[A-Z0-9]*\d[A-Z0-9]*\b', '', simplified)
+                        simplified = re.sub(r'\b[A-Z]{1,3}\b', '', simplified)
+                        simplified = re.sub(r'\s+', ' ', simplified).strip()
+                        retry_chosen = None
+                        if simplified and simplified != title.strip():
+                            print(f"   🔄 Full title got no match, retrying with: '{simplified}'")
+                            try:
+                                r2 = _req.get(
+                                    f"https://api.ebay.com/commerce/taxonomy/v1/category_tree/{_tree_id}/get_category_suggestions",
+                                    params={"q": simplified},
+                                    headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                                    timeout=5
+                                )
+                                if r2.status_code == 200:
+                                    for s2 in r2.json().get("categorySuggestions", []):
+                                        if _tree_id == "100":
+                                            retry_chosen = s2
+                                            break
+                                        anc2 = s2.get("categoryTreeNodeAncestors", []) or []
+                                        top2 = (anc2[-1].get("categoryName", "") if anc2
+                                                else s2.get("category", {}).get("categoryName", "")).lower()
+                                        if top2 == "business & industrial":
+                                            retry_chosen = s2
+                                            break
+                            except Exception as _re:
+                                print(f"   ⚠️  Simplified retry failed: {_re}")
+                        if retry_chosen:
+                            best = retry_chosen["category"]
+                            ebay_category_id = str(best.get("categoryId", ebay_category_id))
+                            ebay_category    = best.get("categoryName", ebay_category)
+                            print(f"   📂 eBay category (from simplified retry): {ebay_category} "
+                                  f"(ID: {ebay_category_id}, tree {_tree_id}, mode {category_mode})")
+                        else:
+                            print(f"   ⚠️  No match in tree {_tree_id} (mode {category_mode}) — "
+                                  f"locked to catch-all category {ebay_category_id}")
             except Exception as _ce:
                 print(f"   ⚠️  Category lookup failed: {_ce}")
 
