@@ -811,7 +811,6 @@ CRITICAL RULES:
                     else:
                         # Retry with simplified title — strip model/part numbers that
                         # overwhelm eBay's suggestion engine
-                        import re
                         simplified = re.sub(r'\b[A-Z0-9]{2,}-[\w-]+\b', '', title)
                         simplified = re.sub(r'\b\d+:\d+\b', '', simplified)
                         simplified = re.sub(r'\b[A-Z0-9]*\d[A-Z0-9]*\b', '', simplified)
