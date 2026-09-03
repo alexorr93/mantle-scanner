@@ -40,6 +40,7 @@ url         = os.getenv("SUPABASE_URL")
 key         = os.getenv("SUPABASE_KEY")
 EBAY_APP_ID = os.getenv("EBAY_APP_ID", "")
 api_key = os.getenv("GEMINI_KEY") or os.getenv("GEMINI_API_KEY")
+openai_api_key = os.getenv("OPENAI_API_KEY", "")
 
 if not all([url, key, api_key]):
     print(f"❌ ERROR: Missing credentials.")
@@ -47,6 +48,15 @@ if not all([url, key, api_key]):
 
 supabase = create_client(url, key)
 client   = genai.Client(api_key=api_key)
+# OpenAI is optional -- only needed if a business has flipped its Scan
+# Provider toggle to ChatGPT (see main.py get_scan_provider / the Upload
+# page toggle). Not required at startup like the Gemini key is, so a
+# missing key here doesn't take the whole scanner down -- it just makes
+# that one group fail with a clear error when it's actually requested.
+_openai_client = None
+if openai_api_key:
+    from openai import OpenAI
+    _openai_client = OpenAI(api_key=openai_api_key)
 
 # ------------------------------------------------------------------ #
 #  SEEN FILES — stored in Supabase, persists across Railway restarts
@@ -465,6 +475,58 @@ class PartIdentification(BaseModel):
     generated_title: str = Field(description="Final eBay title, maximum 80 characters. Must end at a complete word — never cut off mid-word. Priority: brand + part number + item type + key specs. Drop least important words to stay under 80 chars cleanly.")
 
 
+def _identify_part_openai(jpeg_bytes_list: list) -> dict:
+    """ChatGPT side of the Scan Provider toggle (see main.py get_scan_provider /
+    process_group's extraction_provider) -- same job as the Gemini ID pass
+    above (STEP 1: photos -> raw text / brand / part number / title), same
+    return shape (dict with the same 5 keys PartIdentification defines), just
+    a different vendor. Does NOT touch STEP 3 (the Google-Search-grounded
+    pricing pass) -- that stays Gemini-only regardless of this toggle for now,
+    since OpenAI's web_search tool is a genuinely different integration, not
+    a drop-in swap. Caller falls back to Gemini automatically if this raises."""
+    if _openai_client is None:
+        raise Exception("OPENAI_API_KEY not set on this scanner instance")
+    import base64
+    id_prompt = """Analyze this photo of an industrial part for eBay resale.
+
+CRITICAL RULES:
+1. READ FIRST: Transcribe all visible text, numbers, and codes exactly as they appear. Look closely at stamped metal, worn labels, cast markings.
+2. NO GUESSING: Never assume a manufacturer based on color, shape, or style. If it is not written on the part, it is UNBRANDED.
+   EXCEPTION: If you can clearly read a brand name on a label, sticker, or packaging, that IS the brand.
+3. PACKAGING vs PART: If the item appears to be in a bag, box, or has a label — identify the PART INSIDE, not the packaging or label itself.
+   - A yellow CAT bag with part number 17C0033 = a Caterpillar part #17C0033, not a "sticker"
+   - A box with "Donaldson P182050" = a Donaldson filter, not a "box"
+   - Always identify what the part IS, not what it comes in
+3. INTERPRET CORRECTLY: Common stampings on industrial parts have specific meanings:
+   - "CAP XX TONS" means capacity is XX tons e.g. "CAP 10 TONS" = 10 Ton Capacity, NOT a brand called CAP and NOT 10,500 lbs
+   - "WLL XX" = working load limit, NOT a brand
+   - "SWL XX" = safe working load, NOT a brand
+   - "MAX XX LBS" = maximum load, NOT a brand
+   - Numbers alone (e.g. "15000") = weight/load rating in lbs
+   Include these as specs in the title, not as brand names.
+4. CHAIN OF THOUGHT: Fill raw_text_read first, then verified_brand, then verified_part_number, then physical_description, then generated_title.
+
+Return ONLY a JSON object, no other text, in exactly this shape:
+{"raw_text_read": "...", "verified_brand": "...", "verified_part_number": "...", "physical_description": "...", "generated_title": "..."}"""
+
+    content = [{"type": "input_text", "text": id_prompt}]
+    for jpeg_bytes in jpeg_bytes_list:
+        b64 = base64.b64encode(jpeg_bytes).decode("utf-8")
+        content.append({"type": "input_image", "image_url": f"data:image/jpeg;base64,{b64}"})
+
+    response = _openai_client.responses.create(
+        model="gpt-5.4",
+        instructions="You are an expert industrial parts identifier specializing in reading part numbers, model numbers, and brand names from photos. Your PRIMARY job is to find any alphanumeric codes on the item and transcribe them exactly. Part numbers are the most valuable piece of information — they unlock everything else. Even partial numbers are valuable. Read every character carefully.",
+        input=[{"role": "user", "content": content}],
+    )
+    text = (response.output_text or "").strip()
+    if text.startswith("```"):
+        text = text.split("```")[1]
+        if text.startswith("json"):
+            text = text[4:]
+    return json.loads(text.strip())
+
+
 def process_group(group: dict):
     group_id  = group["id"]
     condition = group.get("condition", "used")
@@ -475,6 +537,9 @@ def process_group(group: dict):
     pricing_mode = group.get("pricing_mode", "always_search")
     if pricing_mode not in ("always_search", "api_first"):
         pricing_mode = "always_search"
+    extraction_provider = group.get("extraction_provider", "gemini")
+    if extraction_provider not in ("gemini", "openai"):
+        extraction_provider = "gemini"
     business_id = group.get("business_id")
     if not business_id:
         # Without this the listing insert lands with business_id=NULL, which makes
@@ -551,6 +616,7 @@ def process_group(group: dict):
     print(f"   📸 Found {len(photo_records)} photos")
 
     image_parts  = []
+    jpeg_bytes_list = []
     primary_name = None
     scanned_at   = datetime.now().isoformat()
 
@@ -579,6 +645,7 @@ def process_group(group: dict):
             image_parts.append(
                 types.Part.from_bytes(data=jpeg_bytes, mime_type="image/jpeg")
             )
+            jpeg_bytes_list.append(jpeg_bytes)
 
             # Mark both old and new names as seen
             mark_seen(old_name)
@@ -596,9 +663,24 @@ def process_group(group: dict):
 
     # ---- STEP 1: Structured ID pass using Pydantic schema ----
     _verified_mpn = ""
-    print(f"   \U0001f50d Step 1: Identifying item from photos...")
+    print(f"   \U0001f50d Step 1: Identifying item from photos... (provider: {extraction_provider})")
     title_for_ebay = ""
-    try:
+    if extraction_provider == "openai":
+        try:
+            parsed_data    = _identify_part_openai(jpeg_bytes_list)
+            _verified_mpn  = (parsed_data.get("verified_part_number") or "").strip()
+            title_for_ebay = (parsed_data.get("generated_title") or "").strip()
+            text_found     = (parsed_data.get("raw_text_read") or "").strip()
+            print(f"   \U0001f4dd Text found:   {text_found[:100]}")
+            print(f"   \U0001f3f7\ufe0f  Brand:        {parsed_data.get('verified_brand')}")
+            print(f"   \U0001f522 Part number:  {parsed_data.get('verified_part_number')}")
+            print(f"   \u2705 Title:        {title_for_ebay}")
+        except Exception as _err:
+            print(f"   \u26a0\ufe0f  ChatGPT ID pass failed ({_err}) — falling back to Gemini for this group")
+            extraction_provider = "gemini"  # fall through to the Gemini block below
+
+    if extraction_provider == "gemini":
+      try:
         id_prompt = """Analyze this photo of an industrial part for eBay resale.
 
 CRITICAL RULES:
@@ -655,7 +737,7 @@ CRITICAL RULES:
         print(f"   \U0001f3f7\ufe0f  Brand:        {parsed_data.get('verified_brand')}")
         print(f"   \U0001f522 Part number:  {parsed_data.get('verified_part_number')}")
         print(f"   \u2705 Title:        {title_for_ebay}")
-    except Exception as _err:
+      except Exception as _err:
         print(f"   \u26a0\ufe0f  ID pass failed: {_err}")
     if not title_for_ebay:
         title_for_ebay = ""
