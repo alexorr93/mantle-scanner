@@ -512,10 +512,10 @@ Return ONLY a JSON object, no other text, in exactly this shape:
     content = [{"type": "input_text", "text": id_prompt}]
     for jpeg_bytes in jpeg_bytes_list:
         b64 = base64.b64encode(jpeg_bytes).decode("utf-8")
-        content.append({"type": "input_image", "image_url": f"data:image/jpeg;base64,{b64}"})
+        content.append({"type": "input_image", "image_url": f"data:image/jpeg;base64,{b64}", "detail": "high"})
 
     response = _openai_client.responses.create(
-        model="gpt-5.4",
+        model="gpt-5.5",
         instructions="You are an expert industrial parts identifier specializing in reading part numbers, model numbers, and brand names from photos. Your PRIMARY job is to find any alphanumeric codes on the item and transcribe them exactly. Part numbers are the most valuable piece of information — they unlock everything else. Even partial numbers are valuable. Read every character carefully.",
         input=[{"role": "user", "content": content}],
     )
@@ -698,7 +698,8 @@ CRITICAL RULES:
    - "MAX XX LBS" = maximum load, NOT a brand
    - Numbers alone (e.g. "15000") = weight/load rating in lbs
    Include these as specs in the title, not as brand names.
-4. CHAIN OF THOUGHT: Fill raw_text_read first, then verified_brand, then verified_part_number, then physical_description, then generated_title."""
+4. CHAIN OF THOUGHT: Fill raw_text_read first, then verified_brand, then verified_part_number, then physical_description, then generated_title.
+5. APPLICATION/FITMENT TEXT MATTERS AS MUCH AS THE PART NUMBER: engine/model fitment (e.g. "Mack E7 E-Tech ASET"), capacity/size (e.g. "28 Qt"), and included-hardware notes (e.g. "w/ Bolt") change what this item actually sells for — a generic part number alone often prices as a cheap universal part when the real item is a specific, expensive application. Check every surface in every photo (label, box print, stamped text) for this, not just the primary part-number sticker, and work it into generated_title."""
 
         id_model = "models/gemini-2.5-pro"
         id_resp = None
