@@ -701,7 +701,7 @@ CRITICAL RULES:
 4. CHAIN OF THOUGHT: Fill raw_text_read first, then verified_brand, then verified_part_number, then physical_description, then generated_title.
 5. APPLICATION/FITMENT TEXT MATTERS AS MUCH AS THE PART NUMBER: engine/model fitment (e.g. "Mack E7 E-Tech ASET"), capacity/size (e.g. "28 Qt"), and included-hardware notes (e.g. "w/ Bolt") change what this item actually sells for — a generic part number alone often prices as a cheap universal part when the real item is a specific, expensive application. Check every surface in every photo (label, box print, stamped text) for this, not just the primary part-number sticker, and work it into generated_title."""
 
-        id_model = "models/gemini-2.5-pro"
+        id_model = "models/gemini-2.5-flash"
         id_resp = None
         for _attempt in range(3):
             try:
