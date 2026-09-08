@@ -535,7 +535,7 @@ def process_group(group: dict):
     if category_mode not in ("industrial", "motors"):
         category_mode = "industrial"
     pricing_mode = group.get("pricing_mode", "always_search")
-    if pricing_mode not in ("always_search", "api_first"):
+    if pricing_mode not in ("always_search", "api_first", "api_only"):
         pricing_mode = "always_search"
     extraction_provider = group.get("extraction_provider", "gemini")
     if extraction_provider not in ("gemini", "openai"):
@@ -765,7 +765,18 @@ CRITICAL RULES:
     # sold+active data, trust it and skip the search-and-verify pass entirely —
     # this is the slow step, so skipping it when we already have good data is the
     # whole point of this mode.
-    use_search = True if pricing_mode == "always_search" else (not ebay_has_data)
+    # always_search: always cross-check via Google Search.
+    # api_first: skip search only when the eBay API already returned real data.
+    # api_only (new, opt-in): NEVER grounds via Google Search, even when the eBay
+    # API came back empty — Gemini prices from photos + its own knowledge alone.
+    # Cheapest mode, but no live-web fallback means weaker pricing on the ~half
+    # of scans where eBay genuinely has zero comps (unique/niche surplus parts).
+    if pricing_mode == "always_search":
+        use_search = True
+    elif pricing_mode == "api_only":
+        use_search = False
+    else:  # api_first
+        use_search = not ebay_has_data
     prompt = make_prompt(len(image_parts), condition, ebay_data, id_title=title_for_ebay,
                           allow_search=use_search)
     print(f"   🤖 Step 3: Gemini pricing pass (mode: {pricing_mode}, "
