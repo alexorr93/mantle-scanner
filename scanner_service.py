@@ -758,29 +758,32 @@ CRITICAL RULES:
 
     # ---- STEP 3: Full Gemini pass with real eBay data injected ----
     ebay_has_data = bool(ebay_data.get("has_data"))
-    # always_search (default, unchanged behavior): always cross-check via Google
-    # Search regardless of whether the eBay API succeeded — catches Amazon/Reverb/
-    # Facebook Marketplace comps a structured eBay-only query would miss.
-    # api_first (new, opt-in toggle): if the eBay API already returned real
-    # sold+active data, trust it and skip the search-and-verify pass entirely —
-    # this is the slow step, so skipping it when we already have good data is the
-    # whole point of this mode.
-    # always_search: always cross-check via Google Search.
-    # api_first: skip search only when the eBay API already returned real data.
-    # api_only (new, opt-in): NEVER grounds via Google Search, even when the eBay
-    # API came back empty — Gemini prices from photos + its own knowledge alone.
-    # Cheapest mode, but no live-web fallback means weaker pricing on the ~half
-    # of scans where eBay genuinely has zero comps (unique/niche surplus parts).
-    if pricing_mode == "always_search":
-        use_search = True
-    elif pricing_mode == "api_only":
-        use_search = False
-    else:  # api_first
-        use_search = not ebay_has_data
+    # always_search / api_first / api_only kept below only as labels for the
+    # print line and the pricing_mode column -- the actual decision is now
+    # hardcoded, same pattern as the Pro-escalation kill above (escalate_tiers
+    # = set()). REAL FIX (confirmed against live logs): api_only already
+    # existed as an opt-in toggle, but it's a client-side localStorage default
+    # in main.py's frontend -- 631/639 groups since 9/1 were still on
+    # api_first, and under api_first, "eBay API unavailable" (Browse API has
+    # no true sold-comps endpoint, so unique industrial parts routinely find
+    # zero matches) still triggered full paid Google Search grounding on
+    # ~half of ALL scans, regardless of the Pro->Flash model savings shipped
+    # separately. Toggling a per-browser default was never going to move the
+    # bill for scans run from any other device/session. Hardcoding it here
+    # kills the grounding fee unconditionally, matching what was actually
+    # asked for -- kill the cost, not "make it available to opt into."
+    use_search = False
+    if False:  # dead branches kept only so pricing_mode is still meaningful if ever re-enabled
+        if pricing_mode == "always_search":
+            use_search = True
+        elif pricing_mode == "api_only":
+            use_search = False
+        else:  # api_first
+            use_search = not ebay_has_data
     prompt = make_prompt(len(image_parts), condition, ebay_data, id_title=title_for_ebay,
                           allow_search=use_search)
     print(f"   🤖 Step 3: Gemini pricing pass (mode: {pricing_mode}, "
-          f"web search: {'on' if use_search else 'skipped — trusting eBay API data'})...")
+          f"web search: {'on' if use_search else 'skipped — grounding hardcoded off to kill the fee'})...")
 
     try:
         cfg_kwargs = dict(
@@ -1057,12 +1060,14 @@ def process_legacy_photo(file_info):
                               # 403s, which killed every request before this code ever ran.
         prompt     = make_prompt(1, condition)
 
+        # Grounding hardcoded off here too, same as the STEP 3 fix above --
+        # this path used google_search unconditionally with no toggle at
+        # all, so it was paying the full grounding fee on every legacy scan
+        # regardless of pricing_mode.
         response = call_gemini_with_timeout(lambda: client.models.generate_content(
             model=model,
             contents=[image_part, prompt],
-            config=types.GenerateContentConfig(
-                tools=[types.Tool(google_search=types.GoogleSearch())]
-            )
+            config=types.GenerateContentConfig()
         ), timeout_seconds=150)
 
         # response.text can be None when Google Search tool is used
