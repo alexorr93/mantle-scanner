@@ -741,8 +741,11 @@ CRITICAL RULES:
       except Exception as _err:
         print(f"   \u26a0\ufe0f  ID pass failed: {_err}")
     if not title_for_ebay:
+        # NOTE: must not reference _err here -- Python deletes the except-variable
+        # when the except block ends, so it raised UnboundLocalError, which escaped
+        # process_group and left the group stuck in 'processing' forever.
         title_for_ebay = ""
-        print(f"   ⚠️  ID pass failed: {_err}")
+        print(f"   ⚠️  ID pass returned no title — continuing with full Gemini pass")
 
     # ---- STEP 2: Fetch real eBay prices (sold + active) ----
     ebay_data = {}
