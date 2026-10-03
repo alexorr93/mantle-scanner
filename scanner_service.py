@@ -41,6 +41,7 @@ key         = os.getenv("SUPABASE_KEY")
 EBAY_APP_ID = os.getenv("EBAY_APP_ID", "")
 api_key = os.getenv("GEMINI_KEY") or os.getenv("GEMINI_API_KEY")
 openai_api_key = os.getenv("OPENAI_API_KEY", "")
+anthropic_api_key = os.getenv("ANTHROPIC_API_KEY", "")
 
 if not all([url, key, api_key]):
     print(f"❌ ERROR: Missing credentials.")
@@ -57,6 +58,13 @@ _openai_client = None
 if openai_api_key:
     from openai import OpenAI
     _openai_client = OpenAI(api_key=openai_api_key)
+# Claude is optional the same way -- only needed when a business picks the
+# Claude Scan Provider. Missing key = that group falls back to Gemini.
+_anthropic_client = None
+if anthropic_api_key:
+    import anthropic
+    _anthropic_client = anthropic.Anthropic(api_key=anthropic_api_key)
+CLAUDE_SCAN_MODEL = os.getenv("CLAUDE_SCAN_MODEL", "claude-opus-5-5")
 
 # ------------------------------------------------------------------ #
 #  SEEN FILES — stored in Supabase, persists across Railway restarts
@@ -475,19 +483,7 @@ class PartIdentification(BaseModel):
     generated_title: str = Field(description="Final eBay title, maximum 80 characters. Must end at a complete word — never cut off mid-word. Priority: brand + part number + item type + key specs. Drop least important words to stay under 80 chars cleanly.")
 
 
-def _identify_part_openai(jpeg_bytes_list: list) -> dict:
-    """ChatGPT side of the Scan Provider toggle (see main.py get_scan_provider /
-    process_group's extraction_provider) -- same job as the Gemini ID pass
-    above (STEP 1: photos -> raw text / brand / part number / title), same
-    return shape (dict with the same 5 keys PartIdentification defines), just
-    a different vendor. Does NOT touch STEP 3 (the Google-Search-grounded
-    pricing pass) -- that stays Gemini-only regardless of this toggle for now,
-    since OpenAI's web_search tool is a genuinely different integration, not
-    a drop-in swap. Caller falls back to Gemini automatically if this raises."""
-    if _openai_client is None:
-        raise Exception("OPENAI_API_KEY not set on this scanner instance")
-    import base64
-    id_prompt = """Analyze this photo of an industrial part for eBay resale.
+_OPENAI_ID_PROMPT = """Analyze this photo of an industrial part for eBay resale.
 
 CRITICAL RULES:
 1. READ FIRST: Transcribe all visible text, numbers, and codes exactly as they appear. Look closely at stamped metal, worn labels, cast markings.
@@ -509,6 +505,21 @@ CRITICAL RULES:
 Return ONLY a JSON object, no other text, in exactly this shape:
 {"raw_text_read": "...", "verified_brand": "...", "verified_part_number": "...", "physical_description": "...", "generated_title": "..."}"""
 
+
+def _identify_part_openai(jpeg_bytes_list: list) -> dict:
+    """ChatGPT side of the Scan Provider toggle (see main.py get_scan_provider /
+    process_group's extraction_provider) -- same job as the Gemini ID pass
+    above (STEP 1: photos -> raw text / brand / part number / title), same
+    return shape (dict with the same 5 keys PartIdentification defines), just
+    a different vendor. Does NOT touch STEP 3 (the Google-Search-grounded
+    pricing pass) -- that stays Gemini-only regardless of this toggle for now,
+    since OpenAI's web_search tool is a genuinely different integration, not
+    a drop-in swap. Caller falls back to Gemini automatically if this raises."""
+    if _openai_client is None:
+        raise Exception("OPENAI_API_KEY not set on this scanner instance")
+    import base64
+    id_prompt = _OPENAI_ID_PROMPT
+
     content = [{"type": "input_text", "text": id_prompt}]
     for jpeg_bytes in jpeg_bytes_list:
         b64 = base64.b64encode(jpeg_bytes).decode("utf-8")
@@ -527,6 +538,37 @@ Return ONLY a JSON object, no other text, in exactly this shape:
     return json.loads(text.strip())
 
 
+def _identify_part_claude(jpeg_bytes_list: list) -> dict:
+    """Claude side of the Scan Provider toggle -- same STEP 1 job and same
+    5-key return shape as _identify_part_openai / the Gemini ID pass. STEP 3
+    pricing stays Gemini. Caller falls back to Gemini if this raises."""
+    if _anthropic_client is None:
+        raise Exception("ANTHROPIC_API_KEY not set on this scanner instance")
+    import base64
+    id_prompt = _OPENAI_ID_PROMPT
+    content = []
+    for jpeg_bytes in jpeg_bytes_list:
+        content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
+                        "data": base64.b64encode(jpeg_bytes).decode("utf-8")}})
+    content.append({"type": "text", "text": id_prompt})
+    response = _anthropic_client.messages.create(
+        model=CLAUDE_SCAN_MODEL,
+        max_tokens=2000,
+        system="You are an expert industrial parts identifier specializing in reading part numbers, model numbers, and brand names from photos. Your PRIMARY job is to find any alphanumeric codes on the item and transcribe them exactly. Part numbers are the most valuable piece of information — they unlock everything else. Even partial numbers are valuable. Read every character carefully.",
+        messages=[{"role": "user", "content": content}],
+    )
+    text = "".join(b.text for b in response.content if getattr(b, "type", "") == "text").strip()
+    if text.startswith("```"):
+        text = text.split("```")[1]
+        if text.startswith("json"):
+            text = text[4:]
+    text = text.strip()
+    # tolerate any stray prose around the JSON object
+    if not text.startswith("{") and "{" in text:
+        text = text[text.index("{"):text.rindex("}") + 1]
+    return json.loads(text)
+
+
 def process_group(group: dict):
     group_id  = group["id"]
     condition = group.get("condition", "used")
@@ -538,7 +580,7 @@ def process_group(group: dict):
     if pricing_mode not in ("always_search", "api_first", "api_only"):
         pricing_mode = "always_search"
     extraction_provider = group.get("extraction_provider", "gemini")
-    if extraction_provider not in ("gemini", "openai"):
+    if extraction_provider not in ("gemini", "openai", "claude"):
         extraction_provider = "gemini"
     business_id = group.get("business_id")
     if not business_id:
@@ -665,9 +707,10 @@ def process_group(group: dict):
     _verified_mpn = ""
     print(f"   \U0001f50d Step 1: Identifying item from photos... (provider: {extraction_provider})")
     title_for_ebay = ""
-    if extraction_provider == "openai":
+    if extraction_provider in ("openai", "claude"):
+        _prov_label = "Claude" if extraction_provider == "claude" else "ChatGPT"
         try:
-            parsed_data    = _identify_part_openai(jpeg_bytes_list)
+            parsed_data    = (_identify_part_claude if extraction_provider == "claude" else _identify_part_openai)(jpeg_bytes_list)
             _verified_mpn  = (parsed_data.get("verified_part_number") or "").strip()
             title_for_ebay = (parsed_data.get("generated_title") or "").strip()
             text_found     = (parsed_data.get("raw_text_read") or "").strip()
@@ -676,7 +719,7 @@ def process_group(group: dict):
             print(f"   \U0001f522 Part number:  {parsed_data.get('verified_part_number')}")
             print(f"   \u2705 Title:        {title_for_ebay}")
         except Exception as _err:
-            print(f"   \u26a0\ufe0f  ChatGPT ID pass failed ({_err}) — falling back to Gemini for this group")
+            print(f"   \u26a0\ufe0f  {_prov_label} ID pass failed ({_err}) — falling back to Gemini for this group")
             extraction_provider = "gemini"  # fall through to the Gemini block below
 
     if extraction_provider == "gemini":
