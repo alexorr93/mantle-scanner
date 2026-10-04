@@ -569,6 +569,56 @@ def _identify_part_claude(jpeg_bytes_list: list) -> dict:
     return json.loads(text)
 
 
+def _clip_title(t: str, limit: int = 80) -> str:
+    """eBay's 80-char cap without chopping mid-word (old [:80] produced titles
+    ending in fragments like '...Flanged Le')."""
+    t = re.sub(r"\s+", " ", (t or "").strip())
+    if len(t) <= limit:
+        return t
+    cut = t[:limit + 1].rsplit(" ", 1)[0].rstrip(" -,/")
+    return cut if cut else t[:limit]
+
+
+def _full_pass_other(provider: str, jpeg_bytes_list: list, prompt: str) -> str:
+    """STEP 3 (title, price, category, weight) done by Claude or ChatGPT when the
+    Scan Provider toggle is set to them -- same make_prompt text and same JSON
+    shape the Gemini pass returns, so all parsing below is shared. Raises on any
+    error so the caller falls back to Gemini."""
+    import base64
+    system = ("You are an expert industrial parts resale pricing specialist. You identify parts precisely "
+              "from photos and return accurate structured data. Never guess manufacturer names — only state "
+              "brands you can read on the part. Size comes from the data plate or the valve/pipe markings, "
+              "never from a lone casting/pattern number. Titles must be 80 characters or fewer. "
+              "Return ONLY the JSON object.")
+    if provider == "claude":
+        if _anthropic_client is None:
+            raise Exception("ANTHROPIC_API_KEY not set on this scanner instance")
+        content = [{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
+                    "data": base64.b64encode(b).decode("utf-8")}} for b in jpeg_bytes_list]
+        content.append({"type": "text", "text": prompt})
+        resp = _anthropic_client.messages.create(model=CLAUDE_SCAN_MODEL, max_tokens=4000, system=system,
+                                                 messages=[{"role": "user", "content": content}])
+        text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+    else:
+        if _openai_client is None:
+            raise Exception("OPENAI_API_KEY not set on this scanner instance")
+        content = [{"type": "input_text", "text": prompt}]
+        for b in jpeg_bytes_list:
+            content.append({"type": "input_image", "detail": "high",
+                            "image_url": "data:image/jpeg;base64," + base64.b64encode(b).decode("utf-8")})
+        resp = _openai_client.responses.create(model="gpt-5.5", instructions=system,
+                                               input=[{"role": "user", "content": content}])
+        text = resp.output_text or ""
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-z]*\n?", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\n?```$", "", text).strip()
+    if not text.startswith("{") and "{" in text:
+        text = text[text.index("{"):text.rindex("}") + 1]
+    json.loads(text)  # validate here so a malformed reply triggers the Gemini fallback
+    return text
+
+
 def process_group(group: dict):
     group_id  = group["id"]
     condition = group.get("condition", "used")
@@ -582,6 +632,11 @@ def process_group(group: dict):
     extraction_provider = group.get("extraction_provider", "gemini")
     if extraction_provider not in ("gemini", "openai", "claude"):
         extraction_provider = "gemini"
+    # Per user 10/4: whichever provider the Scan Provider toggle is set to does
+    # ALL fields (ID pass AND the full title/price/category/weight pass), not
+    # just Step 1. Kept separately because Step 1's own error fallback rewrites
+    # extraction_provider to "gemini".
+    selected_provider = extraction_provider
     business_id = group.get("business_id")
     if not business_id:
         # Without this the listing insert lands with business_id=NULL, which makes
@@ -828,57 +883,70 @@ CRITICAL RULES:
             use_search = not ebay_has_data
     prompt = make_prompt(len(image_parts), condition, ebay_data, id_title=title_for_ebay,
                           allow_search=use_search)
-    print(f"   🤖 Step 3: Gemini pricing pass (mode: {pricing_mode}, "
+    print(f"   🤖 Step 3: full pass via {selected_provider} (mode: {pricing_mode}, "
           f"web search: {'on' if use_search else 'skipped — grounding hardcoded off to kill the fee'})...")
 
     try:
-        cfg_kwargs = dict(
-            temperature=0.1,
-            system_instruction="You are an expert industrial parts resale pricing specialist. You identify parts precisely from photos, search eBay for real sold prices, and return accurate structured data. Never guess manufacturer names — only state brands you can read on the part."
-        )
-        if use_search:
-            cfg_kwargs["tools"] = [types.Tool(google_search=types.GoogleSearch())]
-        cfg = types.GenerateContentConfig(**cfg_kwargs)
-        response = None
-        for _attempt in range(3):
-            try:
-                response = call_gemini_with_timeout(lambda: client.models.generate_content(
-                    model=model,
-                    contents=[*image_parts, prompt],
-                    config=cfg
-                ), timeout_seconds=150)  # longer -- this pass does real web/eBay research via Google Search grounding
-                break
-            except Exception as _e:
-                if "did not respond within" in str(_e):
-                    print(f"   ⏳ Gemini stalled, retrying...")
-                elif "503" in str(_e) or "UNAVAILABLE" in str(_e):
-                    print(f"   ⏳ Gemini busy, retrying in 10s (attempt {_attempt+1}/3)...")
-                    time.sleep(10)
-                else:
-                    raise
-        if response is None:
-            raise Exception("Gemini unavailable after 3 retries")
+      def _gemini_full_pass():
+          cfg_kwargs = dict(
+              temperature=0.1,
+              system_instruction="You are an expert industrial parts resale pricing specialist. You identify parts precisely from photos, search eBay for real sold prices, and return accurate structured data. Never guess manufacturer names — only state brands you can read on the part."
+          )
+          if use_search:
+              cfg_kwargs["tools"] = [types.Tool(google_search=types.GoogleSearch())]
+          cfg = types.GenerateContentConfig(**cfg_kwargs)
+          response = None
+          for _attempt in range(3):
+              try:
+                  response = call_gemini_with_timeout(lambda: client.models.generate_content(
+                      model=model,
+                      contents=[*image_parts, prompt],
+                      config=cfg
+                  ), timeout_seconds=150)  # longer -- this pass does real web/eBay research via Google Search grounding
+                  break
+              except Exception as _e:
+                  if "did not respond within" in str(_e):
+                      print(f"   ⏳ Gemini stalled, retrying...")
+                  elif "503" in str(_e) or "UNAVAILABLE" in str(_e):
+                      print(f"   ⏳ Gemini busy, retrying in 10s (attempt {_attempt+1}/3)...")
+                      time.sleep(10)
+                  else:
+                      raise
+          if response is None:
+              raise Exception("Gemini unavailable after 3 retries")
 
-        # response.text can be None when Google Search tool is used
-        def extract_text(resp):
-            if resp is None: return ""
-            try:
-                if resp.text: return resp.text
-            except Exception: pass
-            try:
-                for cand in (resp.candidates or []):
-                    for part in (getattr(cand.content, "parts", None) or []):
-                        t = getattr(part, "text", None)
-                        if t: return t
-            except Exception: pass
-            return ""
-        raw = extract_text(response)
-        raw = (raw or "").strip()
+          # response.text can be None when Google Search tool is used
+          def extract_text(resp):
+              if resp is None: return ""
+              try:
+                  if resp.text: return resp.text
+              except Exception: pass
+              try:
+                  for cand in (resp.candidates or []):
+                      for part in (getattr(cand.content, "parts", None) or []):
+                          t = getattr(part, "text", None)
+                          if t: return t
+              except Exception: pass
+              return ""
+          return (extract_text(response) or "").strip()
+
+      raw = ""
+      if selected_provider in ("claude", "openai"):
+          _lbl = "Claude" if selected_provider == "claude" else "ChatGPT"
+          try:
+              print(f"   🤖 Step 3: {_lbl} full pass (title/price/category/weight)...")
+              raw = _full_pass_other(selected_provider, jpeg_bytes_list, prompt)
+          except Exception as _fp_err:
+              print(f"   ⚠️  {_lbl} full pass failed ({_fp_err}) — falling back to Gemini for this group")
+              raw = ""
+      if not raw:
+          raw = _gemini_full_pass()
+      if True:
         raw = re.sub(r"^```[a-z]*\n?", "", raw, flags=re.IGNORECASE)
         raw = re.sub(r"\n?```$", "", raw).strip()
 
         data             = json.loads(raw)
-        title            = str(data.get("title", "Unknown Item")).strip()[:80]
+        title            = _clip_title(str(data.get("title", "Unknown Item")))
         ebay_category    = str(data.get("ebay_category", "")).strip()
         ebay_category_id = str(parse_int(data.get("ebay_category_id", 0)))
         weight_oz        = parse_num(data.get("weight_oz", 0))
@@ -1135,7 +1203,7 @@ def process_legacy_photo(file_info):
         raw = re.sub(r"\n?```$", "", raw).strip()
 
         data             = json.loads(raw)
-        title            = str(data.get("title", "Unknown Item")).strip()[:80]
+        title            = _clip_title(str(data.get("title", "Unknown Item")))
         ebay_category    = str(data.get("ebay_category", "")).strip()
         ebay_category_id = str(parse_int(data.get("ebay_category_id", 0)))
         weight_oz        = parse_num(data.get("weight_oz", 0))
