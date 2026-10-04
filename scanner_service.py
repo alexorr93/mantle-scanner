@@ -579,7 +579,7 @@ def _clip_title(t: str, limit: int = 80) -> str:
     return cut if cut else t[:limit]
 
 
-def _full_pass_other(provider: str, jpeg_bytes_list: list, prompt: str) -> str:
+def _full_pass_other(provider: str, jpeg_bytes_list: list, prompt: str, use_search: bool = False) -> str:
     """STEP 3 (title, price, category, weight) done by Claude or ChatGPT when the
     Scan Provider toggle is set to them -- same make_prompt text and same JSON
     shape the Gemini pass returns, so all parsing below is shared. Raises on any
@@ -596,9 +596,14 @@ def _full_pass_other(provider: str, jpeg_bytes_list: list, prompt: str) -> str:
         content = [{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
                     "data": base64.b64encode(b).decode("utf-8")}} for b in jpeg_bytes_list]
         content.append({"type": "text", "text": prompt})
-        resp = _anthropic_client.messages.create(model=CLAUDE_SCAN_MODEL, max_tokens=4000, system=system,
-                                                 messages=[{"role": "user", "content": content}])
-        text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+        kw = dict(model=CLAUDE_SCAN_MODEL, max_tokens=8000, system=system,
+                  messages=[{"role": "user", "content": content}])
+        if use_search:
+            kw["tools"] = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}]
+        resp = _anthropic_client.messages.create(**kw)
+        # with search on, the JSON is the LAST text run after the tool calls
+        texts = [b.text for b in resp.content if getattr(b, "type", "") == "text"]
+        text = "".join(texts)
     else:
         if _openai_client is None:
             raise Exception("OPENAI_API_KEY not set on this scanner instance")
@@ -606,8 +611,10 @@ def _full_pass_other(provider: str, jpeg_bytes_list: list, prompt: str) -> str:
         for b in jpeg_bytes_list:
             content.append({"type": "input_image", "detail": "high",
                             "image_url": "data:image/jpeg;base64," + base64.b64encode(b).decode("utf-8")})
-        resp = _openai_client.responses.create(model="gpt-5.5", instructions=system,
-                                               input=[{"role": "user", "content": content}])
+        kw = dict(model="gpt-5.5", instructions=system, input=[{"role": "user", "content": content}])
+        if use_search:
+            kw["tools"] = [{"type": "web_search"}]
+        resp = _openai_client.responses.create(**kw)
         text = resp.output_text or ""
     text = text.strip()
     if text.startswith("```"):
@@ -873,18 +880,19 @@ CRITICAL RULES:
     # bill for scans run from any other device/session. Hardcoding it here
     # kills the grounding fee unconditionally, matching what was actually
     # asked for -- kill the cost, not "make it available to opt into."
-    use_search = False
-    if False:  # dead branches kept only so pricing_mode is still meaningful if ever re-enabled
-        if pricing_mode == "always_search":
-            use_search = True
-        elif pricing_mode == "api_only":
-            use_search = False
-        else:  # api_first
-            use_search = not ebay_has_data
+    # 10/4: the hardcoded-off kill switch (7b09f62, 9/13) is removed -- the
+    # user's Pricing toggle is obeyed again. Web search is the intended price
+    # source; "Always Search" searches every scan.
+    if pricing_mode == "always_search":
+        use_search = True
+    elif pricing_mode == "api_only":
+        use_search = False
+    else:  # api_first
+        use_search = not ebay_has_data
     prompt = make_prompt(len(image_parts), condition, ebay_data, id_title=title_for_ebay,
                           allow_search=use_search)
     print(f"   🤖 Step 3: full pass via {selected_provider} (mode: {pricing_mode}, "
-          f"web search: {'on' if use_search else 'skipped — grounding hardcoded off to kill the fee'})...")
+          f"web search: {'on' if use_search else 'off'})...")
 
     try:
       def _gemini_full_pass():
@@ -935,7 +943,7 @@ CRITICAL RULES:
           _lbl = "Claude" if selected_provider == "claude" else "ChatGPT"
           try:
               print(f"   🤖 Step 3: {_lbl} full pass (title/price/category/weight)...")
-              raw = _full_pass_other(selected_provider, jpeg_bytes_list, prompt)
+              raw = _full_pass_other(selected_provider, jpeg_bytes_list, prompt, use_search)
           except Exception as _fp_err:
               print(f"   ⚠️  {_lbl} full pass failed ({_fp_err}) — falling back to Gemini for this group")
               raw = ""
