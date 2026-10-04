@@ -66,6 +66,32 @@ if anthropic_api_key:
     _anthropic_client = anthropic.Anthropic(api_key=anthropic_api_key)
 CLAUDE_SCAN_MODEL = os.getenv("CLAUDE_SCAN_MODEL", "claude-opus-5-5")
 
+
+def _ensure_provider_clients(business_id):
+    """10/4: the OpenAI/Anthropic keys the user saves on Lister's Settings page
+    live in app_settings, but this scanner only ever read Railway env vars --
+    so with no env var, every ChatGPT/Claude scan silently fell back to Gemini.
+    Env var still wins if set; otherwise load the business's saved key."""
+    global _openai_client, _anthropic_client
+    if not business_id or (_openai_client and _anthropic_client):
+        return
+    try:
+        rows = (supabase.table("app_settings").select("key,value")
+                .eq("business_id", business_id)
+                .in_("key", ["OPENAI_API_KEY", "ANTHROPIC_API_KEY"]).execute().data or [])
+    except Exception as e:
+        print(f"   ⚠️  couldn't read provider keys from app_settings: {e}")
+        return
+    vals = {r["key"]: (r.get("value") or "").strip() for r in rows}
+    if _openai_client is None and vals.get("OPENAI_API_KEY"):
+        from openai import OpenAI
+        _openai_client = OpenAI(api_key=vals["OPENAI_API_KEY"])
+        print("   🔑 OpenAI key loaded from Lister settings")
+    if _anthropic_client is None and vals.get("ANTHROPIC_API_KEY"):
+        import anthropic
+        _anthropic_client = anthropic.Anthropic(api_key=vals["ANTHROPIC_API_KEY"])
+        print("   🔑 Anthropic key loaded from Lister settings")
+
 # ------------------------------------------------------------------ #
 #  SEEN FILES — stored in Supabase, persists across Railway restarts
 # ------------------------------------------------------------------ #
@@ -657,6 +683,8 @@ def process_group(group: dict):
               f"will not be visible in the web app until this is fixed.")
 
     print(f"\n📦 Processing group {group_id} — condition: {condition}, qty: {quantity}, category_mode: {category_mode}")
+    if selected_provider in ("openai", "claude"):
+        _ensure_provider_clients(business_id)
 
     # ATOMIC claim -- root cause of the duplicate-listings bug: two scanner
     # instances (production env + Input env) poll the same table, and a plain
