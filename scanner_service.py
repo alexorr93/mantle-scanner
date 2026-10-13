@@ -43,12 +43,14 @@ api_key = os.getenv("GEMINI_KEY") or os.getenv("GEMINI_API_KEY")
 openai_api_key = os.getenv("OPENAI_API_KEY", "")
 anthropic_api_key = os.getenv("ANTHROPIC_API_KEY", "")
 
-if not all([url, key, api_key]):
+if not all([url, key]):
     print(f"❌ ERROR: Missing credentials.")
     exit()
 
 supabase = create_client(url, key)
-client   = genai.Client(api_key=api_key)
+# 10/13: Gemini is no longer required or used unless a group explicitly picks
+# the Gemini Scan Provider. No key = no Gemini client = Gemini can never bill.
+client   = genai.Client(api_key=api_key) if api_key else None
 # OpenAI is optional -- only needed if a business has flipped its Scan
 # Provider toggle to ChatGPT (see main.py get_scan_provider / the Upload
 # page toggle). Not required at startup like the Gemini key is, so a
@@ -118,6 +120,9 @@ def mark_seen(filename: str):
 # ------------------------------------------------------------------ #
 
 def resolve_model():
+    if client is None:
+        print("ℹ️  No Gemini key set -- Gemini disabled entirely")
+        return "models/gemini-2.5-flash"
     print("🔍 Finding best available model...")
     try:
         all_models = [m.name for m in client.models.list()]
@@ -662,13 +667,16 @@ def process_group(group: dict):
     pricing_mode = group.get("pricing_mode", "always_search")
     if pricing_mode not in ("always_search", "api_first", "api_only"):
         pricing_mode = "always_search"
-    extraction_provider = group.get("extraction_provider", "gemini")
+    extraction_provider = group.get("extraction_provider") or "openai"
     if extraction_provider not in ("gemini", "openai", "claude"):
-        extraction_provider = "gemini"
+        extraction_provider = "openai"
+    if extraction_provider == "gemini" and client is None:
+        print("   ⚠️  group asked for Gemini but no Gemini key is set -- using ChatGPT")
+        extraction_provider = "openai"
     # Per user 10/4: whichever provider the Scan Provider toggle is set to does
     # ALL fields (ID pass AND the full title/price/category/weight pass), not
-    # just Step 1. Kept separately because Step 1's own error fallback rewrites
-    # extraction_provider to "gemini".
+    # just Step 1. 10/13: there is NO Gemini fallback anymore -- a ChatGPT/Claude
+    # error retries the same provider, never silently switches to Gemini.
     selected_provider = extraction_provider
     business_id = group.get("business_id")
     if not business_id:
@@ -799,8 +807,18 @@ def process_group(group: dict):
     title_for_ebay = ""
     if extraction_provider in ("openai", "claude"):
         _prov_label = "Claude" if extraction_provider == "claude" else "ChatGPT"
+        _id_fn = _identify_part_claude if extraction_provider == "claude" else _identify_part_openai
         try:
-            parsed_data    = (_identify_part_claude if extraction_provider == "claude" else _identify_part_openai)(jpeg_bytes_list)
+            parsed_data = None
+            for _attempt in range(3):
+                try:
+                    parsed_data = _id_fn(jpeg_bytes_list)
+                    break
+                except Exception as _e:
+                    if _attempt == 2:
+                        raise
+                    print(f"   ⏳ {_prov_label} ID pass failed ({str(_e)[:120]}) — retrying {_prov_label} ({_attempt+2}/3)")
+                    time.sleep(10 * (_attempt + 1))
             _verified_mpn  = (parsed_data.get("verified_part_number") or "").strip()
             title_for_ebay = (parsed_data.get("generated_title") or "").strip()
             text_found     = (parsed_data.get("raw_text_read") or "").strip()
@@ -809,8 +827,7 @@ def process_group(group: dict):
             print(f"   \U0001f522 Part number:  {parsed_data.get('verified_part_number')}")
             print(f"   \u2705 Title:        {title_for_ebay}")
         except Exception as _err:
-            print(f"   \u26a0\ufe0f  {_prov_label} ID pass failed ({_err}) — falling back to Gemini for this group")
-            extraction_provider = "gemini"  # fall through to the Gemini block below
+            print(f"   \u26a0\ufe0f  {_prov_label} ID pass failed 3x ({str(_err)[:200]}) — no Gemini fallback; full pass will still run on {_prov_label}")
 
     if extraction_provider == "gemini":
       try:
@@ -878,7 +895,7 @@ CRITICAL RULES:
         # when the except block ends, so it raised UnboundLocalError, which escaped
         # process_group and left the group stuck in 'processing' forever.
         title_for_ebay = ""
-        print(f"   ⚠️  ID pass returned no title — continuing with full Gemini pass")
+        print(f"   ⚠️  ID pass returned no title — continuing with full {selected_provider} pass")
 
     # ---- STEP 2: Fetch real eBay prices (sold + active) ----
     ebay_data = {}
@@ -890,7 +907,7 @@ CRITICAL RULES:
             ac = len(ebay_data.get("active_used",[])) + len(ebay_data.get("active_new",[]))
             print(f"   ✅ eBay API: {sc} sold, {ac} active listings found")
         else:
-            print(f"   ⚠️  eBay API unavailable — Gemini will search eBay + web directly")
+            print(f"   ⚠️  eBay API returned no comps — {selected_provider} will price it")
 
     # ---- STEP 3: Full Gemini pass with real eBay data injected ----
     ebay_has_data = bool(ebay_data.get("has_data"))
@@ -969,13 +986,17 @@ CRITICAL RULES:
       raw = ""
       if selected_provider in ("claude", "openai"):
           _lbl = "Claude" if selected_provider == "claude" else "ChatGPT"
-          try:
-              print(f"   🤖 Step 3: {_lbl} full pass (title/price/category/weight)...")
-              raw = _full_pass_other(selected_provider, jpeg_bytes_list, prompt, use_search)
-          except Exception as _fp_err:
-              print(f"   ⚠️  {_lbl} full pass failed ({_fp_err}) — falling back to Gemini for this group")
-              raw = ""
-      if not raw:
+          print(f"   🤖 Step 3: {_lbl} full pass (title/price/category/weight)...")
+          for _attempt in range(3):
+              try:
+                  raw = _full_pass_other(selected_provider, jpeg_bytes_list, prompt, use_search)
+                  break
+              except Exception as _fp_err:
+                  if _attempt == 2:
+                      raise Exception(f"{_lbl} full pass failed 3x, no Gemini fallback: {_fp_err}")
+                  print(f"   ⏳ {_lbl} full pass failed ({str(_fp_err)[:120]}) — retrying {_lbl} ({_attempt+2}/3)")
+                  time.sleep(10 * (_attempt + 1))
+      else:
           raw = _gemini_full_pass()
       if True:
         raw = re.sub(r"^```[a-z]*\n?", "", raw, flags=re.IGNORECASE)
@@ -1111,7 +1132,7 @@ CRITICAL RULES:
             price_note   = "used" if price_new == 0 and price_used > 0 else ""
 
     except Exception as _gemini_err:
-        print(f"   ⚠️  Gemini error: {_gemini_err}")
+        print(f"   ⚠️  Full pass error ({selected_provider}): {_gemini_err}")
         title, ebay_category, price_note = title_for_ebay or "Industrial Part", "", ""
         ebay_category_id = "0"
         weight_oz = weight_lb = 0.00
@@ -1201,6 +1222,10 @@ def process_legacy_photo(file_info):
             print(f"   ⏭️  {photo_id} already produced listing {_already[0]['id']} -- skipping duplicate processing")
             return
 
+        if client is None:
+            # 10/13: legacy single-photo path was Gemini-only. Gemini is off, so skip.
+            print(f"   ⏭️  Legacy single-photo scan skipped (Gemini disabled) -- group it in Lister to scan")
+            return
         image_part = types.Part.from_bytes(data=jpeg_bytes, mime_type="image/jpeg")
         condition  = "used"  # legacy single-photo path has no condition input -- always "used", same
                               # default make_prompt itself uses. Previously passed directly into
