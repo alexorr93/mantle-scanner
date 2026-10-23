@@ -31,6 +31,13 @@ def call_gemini_with_timeout(fn, timeout_seconds=90):
     except concurrent.futures.TimeoutError:
         raise Exception(f"Gemini call did not respond within {timeout_seconds}s (stalled, not a clean error)")
 
+# 10/23: same stall, ChatGPT/Claude side -- their SDK clients were built with
+# the default 600s timeout + 2 silent SDK retries, so one hung request held the
+# whole single-threaded scanner ~30 min (group stuck 'processing' since 16:27
+# UTC 10/23, everything queued behind it). Hard cap each call; the code's own
+# 3x retry loops (ID pass + full pass) handle the retrying, visibly in logs.
+_PROVIDER_TIMEOUT_S = 180.0
+
 # ------------------------------------------------------------------ #
 #  SETUP
 # ------------------------------------------------------------------ #
@@ -59,13 +66,13 @@ client   = genai.Client(api_key=api_key) if api_key else None
 _openai_client = None
 if openai_api_key:
     from openai import OpenAI
-    _openai_client = OpenAI(api_key=openai_api_key)
+    _openai_client = OpenAI(api_key=openai_api_key, timeout=_PROVIDER_TIMEOUT_S, max_retries=0)
 # Claude is optional the same way -- only needed when a business picks the
 # Claude Scan Provider. Missing key = that group falls back to Gemini.
 _anthropic_client = None
 if anthropic_api_key:
     import anthropic
-    _anthropic_client = anthropic.Anthropic(api_key=anthropic_api_key)
+    _anthropic_client = anthropic.Anthropic(api_key=anthropic_api_key, timeout=_PROVIDER_TIMEOUT_S, max_retries=0)
 CLAUDE_SCAN_MODEL = os.getenv("CLAUDE_SCAN_MODEL", "claude-opus-5-5")
 
 
@@ -87,11 +94,11 @@ def _ensure_provider_clients(business_id):
     vals = {r["key"]: (r.get("value") or "").strip() for r in rows}
     if _openai_client is None and vals.get("OPENAI_API_KEY"):
         from openai import OpenAI
-        _openai_client = OpenAI(api_key=vals["OPENAI_API_KEY"])
+        _openai_client = OpenAI(api_key=vals["OPENAI_API_KEY"], timeout=_PROVIDER_TIMEOUT_S, max_retries=0)
         print("   🔑 OpenAI key loaded from Lister settings")
     if _anthropic_client is None and vals.get("ANTHROPIC_API_KEY"):
         import anthropic
-        _anthropic_client = anthropic.Anthropic(api_key=vals["ANTHROPIC_API_KEY"])
+        _anthropic_client = anthropic.Anthropic(api_key=vals["ANTHROPIC_API_KEY"], timeout=_PROVIDER_TIMEOUT_S, max_retries=0)
         print("   🔑 Anthropic key loaded from Lister settings")
 
 # ------------------------------------------------------------------ #
