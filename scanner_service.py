@@ -564,7 +564,7 @@ def _identify_part_openai(jpeg_bytes_list: list) -> dict:
         content.append({"type": "input_image", "image_url": f"data:image/jpeg;base64,{b64}", "detail": "high"})
 
     response = _openai_client.responses.create(
-        model="gpt-5.5",
+        model="gpt-5.6-luna",
         instructions="You are an expert industrial parts identifier specializing in reading part numbers, model numbers, and brand names from photos. Your PRIMARY job is to find any alphanumeric codes on the item and transcribe them exactly. Part numbers are the most valuable piece of information — they unlock everything else. Even partial numbers are valuable. Read every character carefully.",
         input=[{"role": "user", "content": content}],
     )
@@ -649,7 +649,7 @@ def _full_pass_other(provider: str, jpeg_bytes_list: list, prompt: str, use_sear
         for b in jpeg_bytes_list:
             content.append({"type": "input_image", "detail": "high",
                             "image_url": "data:image/jpeg;base64," + base64.b64encode(b).decode("utf-8")})
-        kw = dict(model="gpt-5.5", instructions=system, input=[{"role": "user", "content": content}])
+        kw = dict(model="gpt-5.6-luna", instructions=system, input=[{"role": "user", "content": content}])
         if use_search:
             kw["tools"] = [{"type": "web_search"}]
         resp = _openai_client.responses.create(**kw)
